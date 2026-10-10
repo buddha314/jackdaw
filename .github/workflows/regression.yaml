@@ -2,11 +2,11 @@ name: Regression
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "37 4 * * *"
     # Sundays: the install journey on Windows and macOS.
-    - cron: "0 8 * * 0"
+    - cron: "37 6 * * 0"
   push:
-    tags: ["v*-rc.*"]
+    tags: ["v*-*"]
   workflow_dispatch: {}
 
 concurrency:
@@ -17,19 +17,20 @@ env:
   toolchain: 1.99.0
 
 jobs:
-  # Release gates a tag on this same reusable workflow.
+  # Release gates a tag on this same reusable workflow and runs the install
+  # journeys itself, so a tag here runs only the cross-platform tiers.
   heavy:
-    if: github.event.schedule != '0 8 * * 0'
+    if: github.event_name != 'push' && github.event.schedule != '37 6 * * 0'
     uses: ./.github/workflows/heavy-tier.yaml
 
   install:
-    if: github.event.schedule != '0 8 * * 0'
+    if: github.event_name != 'push' && github.event.schedule != '37 6 * * 0'
     uses: ./.github/workflows/install-contract.yaml
     with:
       journey: true
 
   install-cross-platform:
-    if: github.event.schedule == '0 8 * * 0'
+    if: github.event.schedule == '37 6 * * 0'
     uses: ./.github/workflows/install-contract.yaml
     with:
       journey: true
@@ -56,7 +57,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt, clippy
+          components: clippy
           toolchain: ${{ env.toolchain }}
 
       # Dependencies at opt-level 1 on the 3-core macOS runner: the tests run
@@ -68,8 +69,12 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Fast tier (fmt, clippy, lib tests)
-        run: cargo xtask fast
+      # Formatting does not vary by platform, and the integration tier runs
+      # the library tests too, so of `xtask fast` only clippy is kept: it
+      # lints the cfg(windows) and cfg(target_os = "macos") code that the
+      # Linux Clippy job never compiles.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features dylib -- --deny warnings
 
-      - name: Integration tier
+      - name: Library and integration tests
         run: cargo xtask integration
