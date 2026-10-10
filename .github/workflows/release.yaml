@@ -281,11 +281,9 @@ jobs:
       JACKDAW_RELEASE_BUILD: "1"
       CARGO_FRONTEND: ${{ matrix.glibc_target && 'cargo-zigbuild' || 'cargo' }}
       BUILD_TARGET: ${{ matrix.glibc_target || matrix.triple }}
-    # This job builds the editor twice over: once for the binaries, then
-    # an extension against the staged SDK. With a cold cache that ran past
-    # 120 minutes on Windows and past 180 on the macOS runner, both cut off
-    # mid-smoke-test and reported as `cancelled` rather than as anything a
-    # reader could act on.
+    # This job builds the editor once for the binaries, then an extension
+    # against the staged SDK. A cold macOS or Windows runner can still take
+    # hours, and a job cut off by its limit reports only `cancelled`.
     timeout-minutes: 300
     strategy:
       fail-fast: false
@@ -379,9 +377,9 @@ jobs:
 
       # Final bundles build with one codegen unit and thin LTO, or the
       # platform's LTO override, which take more memory than `cargo install`
-      # is given. Pinned for every cargo invocation in the job: the smoke test
-      # compiles at release too, and a step that resolved a different profile
-      # would rebuild the graph and mix artifact generations.
+      # is given. Pinned for every cargo invocation in the job: the smoke
+      # check builds its extension at release too, and a step that resolved a
+      # different profile would rebuild the graph and mix artifact generations.
       - name: Pin the release profile for the whole job
         if: needs.plan.outputs.profile == 'full'
         run: |
@@ -415,9 +413,11 @@ jobs:
         if: '!matrix.glibc_target'
         run: cargo build --release -p jackdaw_rustc_wrapper
 
-      # The root package owns the editor, jd, and installed wrapper.
+      # The root package owns the editor, jd, and installed wrapper. The
+      # artifact list is kept for the bundler, which would otherwise build
+      # again to learn it.
       - name: Build installed binaries (target)
-        run: $CARGO_FRONTEND build --release --target "$BUILD_TARGET" -p jackdaw --features dylib --bins
+        run: $CARGO_FRONTEND build --release --target "$BUILD_TARGET" -p jackdaw --features dylib --bins --message-format=json-render-diagnostics > "$RUNNER_TEMP/bundle-build.json"
 
       # Under the glibc target the shipped wrapper is the root package's
       # own, built above against the same glibc, placed where the bundler
@@ -472,16 +472,16 @@ jobs:
         # therefore exercises installed behavior and cannot accidentally
         # rewrite scaffolded manifests to local path dependencies.
         #
-        # The bundler reruns the editor build to read its artifact list. Run
-        # through cargo-zigbuild, that nested build inherits the zig
-        # environment and finds the graph fresh instead of relinking the
-        # editor against the runner's glibc.
+        # The bundler reads the SDK's artifacts from the build step's saved
+        # JSON instead of building again. A second build compiled the editor
+        # again whenever its environment differed from the first.
         run: |
           out="$RUNNER_TEMP/jackdaw-${{ matrix.triple }}"
+          artifacts="$RUNNER_TEMP/bundle-build.json"
           if [ -n "${{ matrix.glibc_target }}" ]; then
-            cargo-zigbuild run --quiet --package xtask --manifest-path xtask/Cargo.toml --target "$BUILD_TARGET" -- bundle --out "$out" --workspace .
+            cargo-zigbuild run --quiet --package xtask --manifest-path xtask/Cargo.toml --target "$BUILD_TARGET" -- bundle --out "$out" --workspace . --artifacts "$artifacts"
           else
-            cargo xtask bundle --out "$out" --workspace .
+            cargo xtask bundle --out "$out" --workspace . --artifacts "$artifacts"
           fi
 
       # A binary that needs a newer glibc than the target names fails at the
@@ -541,22 +541,24 @@ jobs:
           if [ "$missing" -ne 0 ]; then echo "staged bundle is incomplete"; exit 1; fi
           echo "bundle layout verified"
 
-      # Build an extension against the just-built release SDK, the way an
-      # installed user does. JACKDAW_BUNDLE_SMOKE_REQUIRED turns the test's
-      # local-only skip into a hard failure so a broken bundle cannot pass silently.
+      # Build an extension against the staged release SDK, the way an
+      # installed user does. It runs from xtask, so the editor is not
+      # compiled again for a test target. Under cargo-zigbuild the extension
+      # build inherits the zig toolchain the staged SDK was linked with.
       - name: Bundle smoke (extension builds against the release SDK)
         if: needs.plan.outputs.warm != 'true'
         env:
-          JACKDAW_BUNDLE_SMOKE_REQUIRED: "1"
-          JACKDAW_BUNDLE_ROOT: ${{ runner.temp }}/jackdaw-${{ matrix.triple }}
           # On failure, the wrapper re-runs the failed unit with rustc's
           # crate-locator trace, so a rejected extern says why it was
           # rejected instead of a bare "can't find crate".
           JACKDAW_WRAPPER_EXPLAIN: "1"
-        # Match the already-built release SDK. The old debug invocation
-        # rebuilt the entire graph and, on Windows, recreated the oversized
-        # debug SDK that the release bundle had already avoided.
-        run: $CARGO_FRONTEND test --release --features dylib --target "$BUILD_TARGET" --test bundle_smoke -- --nocapture
+        run: |
+          bundle="$RUNNER_TEMP/jackdaw-${{ matrix.triple }}"
+          if [ -n "${{ matrix.glibc_target }}" ]; then
+            cargo-zigbuild run --quiet --package xtask --manifest-path xtask/Cargo.toml --target "$BUILD_TARGET" -- bundle-smoke --bundle "$bundle" --workspace .
+          else
+            cargo xtask bundle-smoke --bundle "$bundle" --workspace .
+          fi
 
       - name: Archive (tar.zst)
         if: needs.plan.outputs.warm != 'true' && matrix.archive == 'tar.zst'

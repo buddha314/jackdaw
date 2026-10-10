@@ -126,12 +126,11 @@ impl SdkManifest {
         sdk: &SdkPaths,
         build_args: &[&str],
     ) -> Result<Self, PlanError> {
-        let closure = sdk_runtime_closure(workspace_root, &sdk.triple)?;
-
         // Capture stdout (the JSON artifact stream) but let cargo's own
         // progress reach the terminal, so this step never looks hung on a
         // cold cache.
-        let child = rust_env_command("cargo")
+        let mut cargo = rust_env_command("cargo");
+        let child = without_package_env(&mut cargo)
             .arg("build")
             .args(build_args)
             .args(["--target", &sdk.triple, "--message-format=json"])
@@ -145,6 +144,23 @@ impl SdkManifest {
                 "SDK build for manifest generation failed".into(),
             ));
         }
+        Self::from_build_messages(
+            workspace_root,
+            sdk,
+            &String::from_utf8_lossy(&output.stdout),
+        )
+    }
+
+    /// Enumerate the SDK's runtime-closure artifacts from the JSON messages
+    /// (`--message-format=json`) of a build that already ran, without
+    /// building again. `messages` must come from a build of the same
+    /// package set and target that produced `sdk`.
+    pub fn from_build_messages(
+        workspace_root: &Path,
+        sdk: &SdkPaths,
+        messages: &str,
+    ) -> Result<Self, PlanError> {
+        let closure = sdk_runtime_closure(workspace_root, &sdk.triple)?;
 
         // Cargo reports artifact paths with the platform's separator,
         // so matching only on `/` discarded every artifact on Windows
@@ -159,7 +175,7 @@ impl SdkManifest {
         let mut artifacts = BTreeMap::new();
         let mut link_paths: BTreeSet<String> = BTreeSet::new();
         let mut host_deps: BTreeSet<String> = BTreeSet::new();
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
+        for line in messages.lines() {
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
@@ -593,6 +609,31 @@ fn shadow_names(metadata: &serde_json::Value, manifest: &SdkManifest) -> BTreeSe
         pending.extend(linked.into_iter().flatten().cloned());
     }
     names
+}
+
+/// Clear the variables cargo sets for the package running this process
+/// (`cargo run`, `cargo test`, a build script). A nested cargo reads them as
+/// its own environment, and a build script that tracks one with
+/// `rerun-if-env-changed` reruns: `ring` tracks `CARGO_PKG_NAME` and
+/// `CARGO_MANIFEST_DIR`, so a build that was fresh at the top level
+/// rebuilt `ring` and every crate above it, the editor included.
+fn without_package_env(command: &mut std::process::Command) -> &mut std::process::Command {
+    for (key, _) in std::env::vars_os() {
+        let Some(name) = key.to_str() else {
+            continue;
+        };
+        let set_by_cargo = ["CARGO_PKG_", "CARGO_MANIFEST_", "CARGO_BIN_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+            || matches!(
+                name,
+                "CARGO_CRATE_NAME" | "CARGO_PRIMARY_PACKAGE" | "CARGO_TARGET_TMPDIR" | "OUT_DIR"
+            );
+        if set_by_cargo {
+            command.env_remove(&key);
+        }
+    }
+    command
 }
 
 /// The SDK dylib's runtime dependency closure: `(name, version)`
