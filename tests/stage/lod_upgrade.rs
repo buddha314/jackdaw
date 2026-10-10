@@ -4,11 +4,8 @@
 //! disk only once saved.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
-use jackdaw::progress::EditorProgress;
-use jackdaw::scenes::load_progress::SCENE_LOAD;
 use jackdaw::viewport::MainViewportCamera;
 use jackdaw_api::prelude::*;
 use jackdaw_commands::CommandHistory;
@@ -28,8 +25,10 @@ fn mesh_file() -> String {
   "nodes": [{"name": "Tree", "mesh": 0}],
   "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
   "accessors": [
-    {"componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 2, 1]}
-  ]
+    {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 2, 1]}
+  ],
+  "bufferViews": [{"buffer": 0, "byteLength": 36}],
+  "buffers": [{"byteLength": 36, "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAIA/AAAAAAAAAEAAAAAA"}]
 }"#
     .to_string()
 }
@@ -123,7 +122,7 @@ fn project(scene: &str) -> Project {
 }
 
 fn editor(project: &Project) -> App {
-    let mut app = util::editor_test_app();
+    let mut app = util::editor_test_app_reading(&project.assets);
     app.world_mut()
         .insert_resource(jackdaw::project::ProjectRoot {
             root: project.assets.parent().expect("root").to_path_buf(),
@@ -148,15 +147,7 @@ fn open(app: &mut App, scene: &Path) {
         .call()
         .expect("scene.open dispatches")
         .assert_finished();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while app
-        .world()
-        .resource::<EditorProgress>()
-        .is_running(SCENE_LOAD)
-        && Instant::now() < deadline
-    {
-        app.update();
-    }
+    util::settle_scene_load(app);
     for _ in 0..4 {
         app.update();
     }

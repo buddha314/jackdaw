@@ -68,11 +68,18 @@ pub fn headless_app() -> App {
 #[expect(clippy::allow_attributes, reason = "shared across test binaries")]
 #[allow(dead_code, reason = "shared across test binaries")]
 pub fn ambient_app() -> App {
+    ambient_app_reading(bevy::asset::AssetPlugin::default())
+}
+
+#[expect(clippy::allow_attributes, reason = "shared across test binaries")]
+#[allow(dead_code, reason = "shared across test binaries")]
+fn ambient_app_reading(assets: bevy::asset::AssetPlugin) -> App {
     skip_setup_check();
     isolate_config_dir();
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
+            .set(assets)
             .set(RenderPlugin {
                 render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                     backends: None,
@@ -131,6 +138,60 @@ pub fn editor_test_app() -> App {
     // built-in's operator entities are spawned.
     app.update();
     app
+}
+
+/// Like [`editor_test_app`], with the asset server reading `assets`, as the
+/// editor does for a project it was launched on.
+#[expect(clippy::allow_attributes, reason = "shared across test binaries")]
+#[allow(dead_code, reason = "shared across test binaries")]
+pub fn editor_test_app_reading(assets: &std::path::Path) -> App {
+    let mut app = ambient_app_reading(bevy::asset::AssetPlugin {
+        file_path: assets.to_string_lossy().into_owned(),
+        ..default()
+    });
+    add_editor_plugins(&mut app);
+    app.finish();
+    app.update();
+    app
+}
+
+/// Run frames until `done` holds, failing the test once `limit` has passed
+/// without it. `what` names the awaited state in the failure.
+#[expect(clippy::allow_attributes, reason = "shared across test binaries")]
+#[allow(dead_code, reason = "shared across test binaries")]
+pub fn update_until(
+    app: &mut App,
+    what: &str,
+    limit: std::time::Duration,
+    mut done: impl FnMut(&mut App) -> bool,
+) {
+    let started = std::time::Instant::now();
+    while !done(app) {
+        assert!(
+            started.elapsed() < limit,
+            "gave up after {limit:?} waiting for {what}"
+        );
+        app.update();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Run frames until the scene load the last open began is over. The limit is
+/// under the load's own stall limit, so a model that never comes in fails the
+/// test instead of ending the load quietly.
+#[expect(clippy::allow_attributes, reason = "shared across test binaries")]
+#[allow(dead_code, reason = "shared across test binaries")]
+pub fn settle_scene_load(app: &mut App) {
+    update_until(
+        app,
+        "the scene load to finish",
+        std::time::Duration::from_secs(45),
+        |app| {
+            !app.world()
+                .resource::<jackdaw::progress::EditorProgress>()
+                .is_running(jackdaw::scenes::load_progress::SCENE_LOAD)
+        },
+    );
 }
 
 /// Advance the app's clock by a fixed step per frame, so gestures measured
