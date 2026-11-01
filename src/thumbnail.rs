@@ -130,6 +130,13 @@ pub(crate) fn plugin(app: &mut App) {
                 capture_pending_scene,
             )
                 .run_if(in_state(crate::AppState::Editor)),
+        )
+        .add_systems(
+            PostUpdate,
+            sync_thumbnail_layers
+                .after(bevy::camera::visibility::VisibilitySystems::CalculateBounds)
+                .before(bevy::camera::visibility::VisibilitySystems::CheckVisibility)
+                .run_if(in_state(crate::AppState::Editor)),
         );
 }
 
@@ -359,7 +366,7 @@ fn cache_file_name(path: &Path, mtime: SystemTime) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!(
-        "{:016x}-{:x}.png",
+        "v2-{:016x}-{:x}.png",
         fnv1a64(path.to_string_lossy().as_bytes()),
         stamp
     )
@@ -1176,6 +1183,31 @@ fn apply_layer_recursive(commands: &mut Commands, entity: Entity, children: &Que
     }
 }
 
+/// Native LOD parts and asynchronously spawned glTF descendants may arrive
+/// after the initial framing pass. RenderLayers are not inherited by Bevy.
+/// Run after native LOD placement, before per-camera visibility is checked.
+fn sync_thumbnail_layers(
+    mut commands: Commands,
+    roots: Query<Entity, With<ThumbnailSubject>>,
+    nodes: Query<(Option<&RenderLayers>, Option<&Children>)>,
+) {
+    let layer = RenderLayers::layer(THUMBNAIL_LAYER);
+    for root in &roots {
+        let mut pending = vec![root];
+        while let Some(entity) = pending.pop() {
+            let Ok((current, children)) = nodes.get(entity) else {
+                continue;
+            };
+            if current != Some(&layer) {
+                commands.entity(entity).insert(layer.clone());
+            }
+            if let Some(children) = children {
+                pending.extend(children.iter());
+            }
+        }
+    }
+}
+
 // -- Scene pictures ----------------------------------------------------------
 
 /// Ask for a picture of the scene just saved to `path`.
@@ -1364,6 +1396,33 @@ mod tests {
     // is the pure half: the cache rules, the framing arithmetic and the slot
     // bookkeeping. The rendering is covered by the screenshot evidence run
     // instead.
+
+    #[test]
+    fn thumbnail_layers_follow_meshes_that_arrive_after_framing() {
+        let mut app = App::new();
+        app.add_systems(Update, sync_thumbnail_layers);
+        let root = app
+            .world_mut()
+            .spawn((ThumbnailSubject, RenderLayers::layer(THUMBNAIL_LAYER)))
+            .id();
+        app.update();
+        let late = app
+            .world_mut()
+            .spawn((ChildOf(root), RenderLayers::default()))
+            .id();
+        let mesh = app.world_mut().spawn(ChildOf(late)).id();
+        app.update();
+        for entity in [late, mesh] {
+            assert_eq!(
+                app.world().get::<RenderLayers>(entity),
+                Some(&RenderLayers::layer(THUMBNAIL_LAYER))
+            );
+        }
+        assert!(
+            cache_file_name(Path::new("/tree.bsn"), epoch(1)).starts_with("v2-"),
+            "old empty previews must be regenerated"
+        );
+    }
 
     fn epoch(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
