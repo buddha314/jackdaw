@@ -15,6 +15,14 @@ mod terrain_set;
 
 pub use terrain_set::TerrainSetError;
 
+/// A map's authored bounds as the kernel's cell rectangle.
+pub fn map_bounds(bounds: Option<IRect>) -> Option<jackdaw_tilemap::CellRect> {
+    bounds.map(|b| jackdaw_tilemap::CellRect {
+        min: b.min,
+        max: b.max,
+    })
+}
+
 /// Registers [`Tileset`] as a reflected asset.
 pub struct TilesetPlugin;
 
@@ -22,6 +30,9 @@ impl Plugin for TilesetPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<Tileset>()
             .register_asset_reflect::<Tileset>();
+        #[cfg(feature = "render")]
+        app.init_resource::<chunk::TileStrips>()
+            .add_systems(Update, chunk::fill_strips);
     }
 }
 
@@ -58,6 +69,10 @@ pub struct Tileset {
     /// Set by an import that ran auto setup, and cleared with what it made.
     #[reflect(default)]
     pub auto_setup: bool,
+    /// Terrain sets removed by hand, inner then outer, which a re-run of auto
+    /// setup does not propose again.
+    #[reflect(default)]
+    pub removed_terrain_sets: Vec<[TerrainId; 2]>,
 }
 
 impl Default for Tileset {
@@ -76,6 +91,7 @@ impl Default for Tileset {
             properties: BTreeMap::new(),
             stamps: Vec::new(),
             auto_setup: false,
+            removed_terrain_sets: Vec::new(),
         }
     }
 }
@@ -402,6 +418,9 @@ impl Tileset {
             tiles,
             stamps,
             next_id: self.next_terrain_id,
+            removed_sets: (self.removed_terrain_sets.iter())
+                .map(|&[inner, outer]| (inner, outer))
+                .collect(),
         })
     }
 
@@ -454,6 +473,9 @@ impl Tileset {
             })
             .collect();
         self.terrain_sets = setup.sets.iter().map(tileset_set).collect();
+        self.removed_terrain_sets = (setup.removed_sets.iter())
+            .map(|&(inner, outer)| [inner, outer])
+            .collect();
         self.tiles = tiles;
         self.objects = objects;
         self.next_terrain_id = setup.next_id;

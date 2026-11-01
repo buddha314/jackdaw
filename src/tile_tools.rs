@@ -14,7 +14,8 @@ use jackdaw_api_internal::operator::warn_caller;
 use jackdaw_input::prelude::{ContextActivity, ContextPriority, InputContext};
 use jackdaw_scene_types::{Tilemap, TilemapLayerKind};
 use jackdaw_tilemap::{
-    CHUNK_SIZE, CellCoord, CellRect, Grid, LayerData, TerrainId, TileRef, orthogonal_line,
+    CHUNK_SIZE, CellCoord, CellRect, Grid, LayerData, Placement, TerrainId, TileRef,
+    orthogonal_line,
 };
 use jackdaw_tileset::Tileset;
 
@@ -179,7 +180,7 @@ pub struct TileStrokeState {
 /// A held stroke: Brush and Eraser write as they go; a shape paints the map
 /// and layer it was pressed on when released.
 enum Held {
-    Stroke(TilemapStrokeBuilder),
+    Stroke(Box<TilemapStrokeBuilder>),
     Shape(Entity, usize),
 }
 
@@ -240,40 +241,36 @@ pub fn cell_at(point: Vec2, map: &GlobalTransform, cell_size: UVec2) -> CellCoor
 #[operator(
     id = "tilemap.edit_mode",
     label = "Tile Edit Mode",
-    description = "Paint the selected tilemap's cells with the tile tools.",
+    description = "Paint the selected tilemap's cells with the tile tools; while the mode is on, \
+                   move to another layer.",
     allows_undo = false,
     is_available = can_enter_edit_mode,
     unavailable_reason = edit_mode_unavailable,
-    params(layer(i64, doc = "Index of the layer to paint; defaults to 0.")),
+    params(layer(i64, doc = "Index of the layer to paint; defaults to the painted layer, or 0.")),
 )]
 pub(crate) fn tilemap_edit_mode(
     params: In<OperatorParameters>,
     world: &mut World,
 ) -> OperatorResult {
-    let map = world.resource::<Selection>().primary();
-    let layers = map
-        .and_then(|m| world.get::<Tilemap>(m))
-        .map(|t| t.layers.len());
-    let layer = params.as_int("layer").unwrap_or(0);
-    match usize::try_from(layer)
-        .ok()
-        .filter(|l| *l < layers.unwrap_or(0))
-    {
-        Some(layer) => {
-            *world.resource_mut::<TileEditMode>() = TileEditMode {
-                map,
-                layer,
-                tool: TileTool::Brush,
-            };
-            set_context_active(world, true);
-            OperatorResult::Finished
-        }
-        None => {
-            let id = TilemapEditModeOp::ID;
-            warn_caller(world, format!("{id}: the map has no layer {layer}"));
-            OperatorResult::Cancelled
-        }
-    }
+    let id = TilemapEditModeOp::ID;
+    let selected = world.resource::<Selection>().primary();
+    let Some((map, layers)) =
+        selected.and_then(|m| world.get::<Tilemap>(m).map(|t| (m, t.layers.len())))
+    else {
+        warn_caller(world, format!("{id}: no tilemap is selected"));
+        return OperatorResult::Cancelled;
+    };
+    let mode = *world.resource::<TileEditMode>();
+    let current = if mode.map == Some(map) { mode.layer } else { 0 };
+    let layer = params
+        .as_int("layer")
+        .unwrap_or_else(|| i64::try_from(current).unwrap_or(0));
+    let Some(index) = usize::try_from(layer).ok().filter(|l| *l < layers) else {
+        warn_caller(world, format!("{id}: the map has no layer {layer}"));
+        return OperatorResult::Cancelled;
+    };
+    enter_layer(world, map, index);
+    OperatorResult::Finished
 }
 
 /// Whether a modal operator is running, read from a world without a system.
@@ -295,10 +292,15 @@ pub(crate) fn tile_mode_reason(world: &World) -> Option<String> {
 }
 
 fn edit_mode_unavailable(world: &World) -> Option<String> {
+    let selected = world.resource::<Selection>().primary();
+    let on = world.resource::<TileEditMode>().map;
     let reason = if modal_running(world) {
         "Finish the running tool first"
-    } else if world.resource::<TileEditMode>().map.is_some() {
-        "Tile edit mode is already on"
+    } else if on.is_some()
+        && on != selected
+        && selected.is_some_and(|m| world.get::<Tilemap>(m).is_some())
+    {
+        "Tile edit mode is on another map"
     } else {
         "Select a tilemap to edit its tiles"
     };
@@ -311,9 +313,10 @@ fn can_enter_edit_mode(
     maps: Query<(), With<Tilemap>>,
     active: ActiveModalQuery,
 ) -> bool {
-    mode.map.is_none()
+    let primary = selection.primary();
+    (mode.map.is_none() || mode.map == primary)
         && !active.is_modal_running()
-        && selection.primary().is_some_and(|e| maps.contains(e))
+        && primary.is_some_and(|e| maps.contains(e))
 }
 
 /// Leave tile edit mode.
@@ -664,10 +667,20 @@ pub(crate) fn paint_cells(
     cells: &[CellCoord],
 ) -> Result<usize, String> {
     let mut builder = TilemapStrokeBuilder::begin(world, map, layer, label)?;
+    check_paint(&builder, paint)?;
     let changed: usize = (paint.writes(cells).into_iter())
         .map(|(write, cells)| builder.apply(world, &cells, write))
         .sum();
     Ok(if builder.end(world) { changed } else { 0 })
+}
+
+/// Refuses `paint` when the stroke's layer cannot take what it writes; a
+/// stamp always writes hand-placed tiles.
+fn check_paint(builder: &TilemapStrokeBuilder, paint: &Paint) -> Result<(), String> {
+    match paint {
+        Paint::Write(write) => builder.check(write),
+        Paint::Stamp(_) => builder.check(&TileWrite::Tile(TileRef::new(0))),
+    }
 }
 
 /// The cells of a Rectangle (both corners included, clipped to `bounds`) or
@@ -733,10 +746,11 @@ fn tile_stroke(world: &mut World, tool: TileTool) -> Option<OperatorResult> {
         let begun = stroke_paint(world, tool, button).and_then(|paint| {
             let erase = paint == Paint::Write(TileWrite::Erase);
             let builder = begin_stroke(world, tool, erase)?;
+            check_paint(&builder, &paint)?;
             let mode = *world.resource::<TileEditMode>();
             let held = match mode.map {
                 Some(map) if tool.is_shape() => Held::Shape(map, mode.layer),
-                _ => Held::Stroke(builder),
+                _ => Held::Stroke(Box::new(builder)),
             };
             Ok((held, paint))
         });
@@ -968,11 +982,8 @@ fn fill_cells(
     if write == target || (write == TileWrite::Erase && empty) {
         return Ok(Vec::new());
     }
-    let region = match bounds {
-        Some(b) => CellRect {
-            min: b.min,
-            max: b.max,
-        },
+    let region = match jackdaw_tileset::map_bounds(bounds) {
+        Some(b) => b,
         None => {
             let painted = if terrain_layer {
                 authoring.and_then(|a| a.terrain.painted_bounds())
@@ -1070,7 +1081,12 @@ fn pick(world: &mut World, cell: CellCoord) -> Result<(), String> {
     let layer = (store.get(&active.key)).and_then(|data| data.layers.get(active.index));
     let authoring = layer.and_then(|l| l.authoring.as_ref());
     let terrain = (authoring.filter(|_| active.terrain)).map_or(0, |a| a.terrain.get(cell));
-    let (tile, placed) = shown_tile(layer, cell);
+    let between = layer.is_some_and(|l| l.placement == Placement::BetweenCells);
+    let (tile, placed) = if between {
+        (TileRef::EMPTY, false)
+    } else {
+        shown_tile(layer, cell)
+    };
     if terrain == 0 && tile.is_empty() {
         return Err(format!("cell {},{} is empty", cell.0.x, cell.0.y));
     }
@@ -1089,10 +1105,13 @@ fn pick(world: &mut World, cell: CellCoord) -> Result<(), String> {
 }
 
 /// The tile a cell shows, its hand-placed tile else its resolved one, and
-/// whether it is hand-placed.
+/// whether it is hand-placed. On a layer whose tiles sit between cells it is
+/// the tile keyed at the cell, the one whose bottom-left corner is the cell,
+/// and hand-placed tiles are not shown.
 pub(crate) fn shown_tile(layer: Option<&LayerData>, cell: CellCoord) -> (TileRef, bool) {
-    let placed =
-        (layer.and_then(|l| l.authoring.as_ref())).and_then(|a| a.overrides.get(&cell).copied());
+    let placed = (layer.filter(|l| l.placement == Placement::OnCells))
+        .and_then(|l| l.authoring.as_ref())
+        .and_then(|a| a.overrides.get(&cell).copied());
     match placed {
         Some(tile) => (tile, true),
         None => (layer.map_or(TileRef::EMPTY, |l| l.tiles.get(cell)), false),
