@@ -573,6 +573,26 @@ fn spawn_folder_row(
     is_root: bool,
     expanded: &HashSet<PathBuf>,
 ) {
+    let path = path.to_path_buf();
+    let expanded = expanded.clone();
+    // Dock reconciliation may destroy the panel before these deferred commands
+    // run. Inserting ChildOf with a dead target removes the relationship and
+    // leaves a visible UI root over the editor's title bar.
+    commands.queue(move |world: &mut World| {
+        if world.get_entity(parent).is_err() {
+            return;
+        }
+        spawn_folder_row_contents(&mut world.commands(), parent, &path, is_root, &expanded);
+    });
+}
+
+fn spawn_folder_row_contents(
+    commands: &mut Commands,
+    parent: Entity,
+    path: &Path,
+    is_root: bool,
+    expanded: &HashSet<PathBuf>,
+) {
     let is_open = expanded.contains(path);
     let label = if is_root {
         "Assets".to_string()
@@ -661,7 +681,7 @@ fn spawn_folder_row(
         .id();
     if is_open {
         for nested in scan_folders(path) {
-            spawn_folder_row(commands, children, &nested, false, expanded);
+            spawn_folder_row_contents(commands, children, &nested, false, expanded);
         }
     }
 
@@ -2422,6 +2442,33 @@ mod tests {
         app.world_mut().run_system(system).expect("the row spawns");
         app.world_mut().flush();
         app
+    }
+
+    /// A dock rebuild can retire the destination before a queued refresh runs.
+    #[test]
+    fn a_folder_refresh_does_not_spawn_into_a_retired_panel() {
+        let mut app = app_with_a_folder_row();
+        let parent = app.world().resource::<RowStore>().0.unwrap();
+        app.world_mut().entity_mut(parent).despawn();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let destination = app.world_mut().spawn(Node::default()).id();
+        spawn_folder_row(
+            &mut Commands::new(&mut queue, app.world()),
+            destination,
+            Path::new("/project/assets"),
+            true,
+            &HashSet::new(),
+        );
+        app.world_mut().entity_mut(destination).despawn();
+        queue.apply(app.world_mut());
+        app.world_mut().flush();
+        assert_eq!(
+            app.world_mut()
+                .query::<&ProjectFolderNode>()
+                .iter(app.world())
+                .count(),
+            0
+        );
     }
 
     /// A folder row opens on a feathers disclosure toggle, and the row's open
