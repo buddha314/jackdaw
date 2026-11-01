@@ -11,7 +11,7 @@
   syncing upstream.
 - **Fork changes are bug fixes only.** Never adapt the editor to a game: game-specific
   needs belong in the game project, through Jackdaw's own extension points (reflected
-  components, `HiddenInGame`, prefabs). Offer every fix upstream as a PR.
+  components, `HiddenInGame`, prefabs). Publish fixes only to the buddha314 fork; jbuehler23 is read-only.
 - Keep `main` current: merge `upstream/main` regularly, rebuild `-p jackdaw -p jd`
   with the pinned toolchain, and push to `origin`.
 - The editor and CLI are system-wide through soft links:
@@ -31,3 +31,11 @@ Keep testing minimal. Use one relevant build or focused regression. Do not run
 full upstream test suites, documentation builds or doctests by default. Do not
 install test infrastructure just to run broad suites. Stop when the relevant
 check passes; graphical smoke tests retain the independent 20-second watchdog.
+
+## Hard rule: jbuehler23 is read-only
+
+Never push to jbuehler23, whether through a named remote, a direct URL, GitHub CLI,
+an API or any other route. Never open pull requests or publish changes to that
+account. Fetching and reading are allowed. All pushes and PRs go only to buddha314.
+This rule overrides any older instruction to offer fixes upstream. The upstream
+remote's push URL is deliberately disabled; do not restore or bypass it.
