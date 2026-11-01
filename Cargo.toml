@@ -71,6 +71,7 @@ members = [
 ]
 
 [dependencies]
+chrono = { version = "~0.4.45", default-features = false, features = ["std"] }
 bevy = { workspace = true, features = [
     "system_font_discovery",
     "system_clipboard",
