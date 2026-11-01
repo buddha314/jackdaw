@@ -4199,6 +4199,7 @@ dependencies = [
  "base64 0.22.1",
  "bevy",
  "bevy_window_chrome",
+ "chrono",
  "dirs",
  "dunce",
  "flate2",

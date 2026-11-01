@@ -140,9 +140,14 @@ pub fn file_icon(name: &str) -> Icon {
 }
 
 fn truncate_name(name: &str, max_len: usize) -> String {
-    if name.len() <= max_len {
+    if name.chars().count() <= max_len {
         name.to_string()
     } else {
-        format!("{}...", &name[..max_len - 3])
+        format!(
+            "{}...",
+            name.chars()
+                .take(max_len.saturating_sub(3))
+                .collect::<String>()
+        )
     }
 }

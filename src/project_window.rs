@@ -6,9 +6,11 @@
 //! action for anything else. The kind filter narrows the tiles to one sort of
 //! file, which is what the catalog listing used to be a window for.
 
+use jackdaw_feathers::segmented;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
+use std::time::SystemTime;
 
 use bevy::ecs::spawn::Spawn;
 use bevy::feathers::controls::FeathersDisclosureToggle;
@@ -16,7 +18,7 @@ use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures_lite::future};
 use bevy::ui::Checked;
-use bevy::ui_widgets::ValueChange;
+use bevy::ui_widgets::{ListBox, ValueChange};
 use jackdaw_api::prelude::*;
 use jackdaw_api_internal::operator::warn_caller;
 use jackdaw_feathers::button::{ButtonProps, ButtonVariant, button};
@@ -163,6 +165,7 @@ pub struct DirEntry {
     pub file_name: String,
     pub is_directory: bool,
     pub texture_info: Option<TextureInfo>,
+    pub modified: Option<SystemTime>,
     /// What the file says it holds; `Scene` for everything that says nothing.
     pub kind: AssetFileKind,
     /// The folder the file sits in, relative to the one the tiles are
@@ -175,6 +178,15 @@ impl DirEntry {
         self.kind == AssetFileKind::Prefab
     }
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserView {
+    #[default]
+    Gallery,
+    List,
+}
+#[derive(Component)]
+struct ViewChoice(BrowserView);
 
 /// What the Project window is showing.
 #[derive(Resource)]
@@ -189,11 +201,13 @@ pub struct ProjectWindowState {
     /// What the search box holds.
     pub search: String,
     pub kind_filter: KindFilter,
+    pub view: BrowserView,
     pub entries: Vec<DirEntry>,
     pub needs_refresh: bool,
     pub needs_tree_refresh: bool,
     /// Whether the tiles are behind the listing.
     needs_tiles: bool,
+    reveal_selection: bool,
     /// The file whose tile is showing a rename field.
     pub renaming: Option<PathBuf>,
     /// Whether the last narrowed listing gave up before it reached the bottom
@@ -214,10 +228,12 @@ impl Default for ProjectWindowState {
             selected_file: None,
             search: String::new(),
             kind_filter: KindFilter::default(),
+            view: BrowserView::default(),
             entries: Vec::new(),
             needs_refresh: true,
             needs_tree_refresh: true,
             needs_tiles: true,
+            reveal_selection: false,
             renaming: None,
             stopped_looking: false,
             expanded: HashSet::new(),
@@ -235,6 +251,14 @@ impl ProjectWindowState {
             current_directory: directory.clone(),
             root_directory: directory,
             ..Self::default()
+        }
+    }
+
+    fn set_view(&mut self, view: BrowserView) {
+        if self.view != view {
+            self.view = view;
+            self.needs_tiles = true;
+            self.reveal_selection = self.selected_file.is_some();
         }
     }
 
@@ -368,6 +392,17 @@ impl Plugin for ProjectWindowPlugin {
                 )
                     .run_if(in_state(crate::AppState::Editor)),
             )
+            .add_systems(
+                Update,
+                sync_view_choices.run_if(in_state(crate::AppState::Editor)),
+            )
+            .add_systems(
+                PostUpdate,
+                reveal_selected_entry
+                    .after(bevy::ui::UiSystems::Layout)
+                    .run_if(in_state(crate::AppState::Editor)),
+            )
+            .add_observer(on_view_choice)
             .add_observer(on_folder_toggled)
             .add_observer(on_folder_disclosure_change)
             .add_observer(on_file_double_click)
@@ -407,9 +442,7 @@ fn watch_directory(root: &Path, commands: &mut Commands) {
             use notify::EventKind;
             if matches!(
                 event.kind,
-                EventKind::Create(_)
-                    | EventKind::Remove(_)
-                    | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_)
             ) {
                 let _ = tx.send(());
             }
@@ -813,7 +846,11 @@ fn dir_entry(path: PathBuf, current: &Path, selected: Option<&str>) -> Option<Di
     // `DirEntry::file_type` reports the link itself, which takes a
     // symlinked directory for a file. Ask the path, which follows it.
     let is_directory = path.is_dir();
+    let modified = std::fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok();
     Some(DirEntry {
+        modified,
         path,
         file_name,
         is_directory,
@@ -969,6 +1006,9 @@ fn rebuild_tiles(
         }
     }
 
+    if state.view == BrowserView::List {
+        spawn_list_header(&mut commands, grid);
+    }
     let mut entries = state.entries.clone();
     let selected = state.selected_file.clone();
     let renaming = state.renaming.clone();
@@ -1000,6 +1040,7 @@ fn rebuild_tiles(
             &icon_font,
             selected.as_deref() == Some(entry.path.to_string_lossy().as_ref()),
             renaming.as_deref() == Some(entry.path.as_path()),
+            state.view,
         );
         attach_tile_behaviour(&mut commands, tile, entry);
     }
@@ -1058,42 +1099,47 @@ fn spawn_tile(
     icon_font: &IconFont,
     is_selected: bool,
     is_renaming: bool,
+    view: BrowserView,
 ) -> Entity {
     let definition = entry
         .kind
         .type_path()
         .and_then(|type_path| kinds.by_type_path(type_path));
-    let tile = match &entry.texture_info {
-        Some(info) => spawn_image_tile(commands, entry, info, is_renaming),
-        None => {
-            let item = FileBrowserItem {
-                path: entry.path.to_string_lossy().to_string(),
-                is_directory: entry.is_directory,
-                file_name: entry.file_name.clone(),
-            };
-            let icon = definition
-                .map(|kind| kind.icon)
-                .or_else(|| entry.is_prefab().then_some(icons::Icon::Package));
-            let tile = match tile_subject(entry, kinds) {
-                Some(subject) => commands
-                    .spawn(thumbnail_tile(
-                        &item,
-                        icon_font,
-                        entry.path.clone(),
-                        subject,
-                        icon,
-                    ))
-                    .id(),
-                None => commands
-                    .spawn(file_browser::file_browser_item_with_icon(
-                        &item, icon_font, icon,
-                    ))
-                    .id(),
-            };
-            if is_renaming {
-                commands.spawn((rename_field(&entry.path), ChildOf(tile)));
+    let tile = if view == BrowserView::List {
+        spawn_list_tile(commands, entry, kinds, icon_font, is_renaming)
+    } else {
+        match &entry.texture_info {
+            Some(info) => spawn_image_tile(commands, entry, info, is_renaming),
+            None => {
+                let item = FileBrowserItem {
+                    path: entry.path.to_string_lossy().to_string(),
+                    is_directory: entry.is_directory,
+                    file_name: entry.file_name.clone(),
+                };
+                let icon = definition
+                    .map(|kind| kind.icon)
+                    .or_else(|| entry.is_prefab().then_some(icons::Icon::Package));
+                let tile = match tile_subject(entry, kinds) {
+                    Some(subject) => commands
+                        .spawn(thumbnail_tile(
+                            &item,
+                            icon_font,
+                            entry.path.clone(),
+                            subject,
+                            icon,
+                        ))
+                        .id(),
+                    None => commands
+                        .spawn(file_browser::file_browser_item_with_icon(
+                            &item, icon_font, icon,
+                        ))
+                        .id(),
+                };
+                if is_renaming {
+                    commands.spawn((rename_field(&entry.path), ChildOf(tile)));
+                }
+                tile
             }
-            tile
         }
     };
     if let Some(definition) = definition {
@@ -1102,10 +1148,18 @@ fn spawn_tile(
             .insert((Hovered::default(), Tooltip::title(definition.label.clone())));
     }
 
-    if let Some(folder) = &entry.folder {
+    commands
+        .entity(tile)
+        .insert((Hovered::default(), Tooltip::title(entry.file_name.clone())));
+    if view == BrowserView::Gallery
+        && let Some(folder) = &entry.folder
+    {
         attach_folder_caption(commands, tile, &entry.path, folder);
     }
     if is_selected {
+        if view == BrowserView::List {
+            commands.entity(tile).insert(Checked);
+        }
         commands
             .entity(tile)
             .insert(BackgroundColor(tokens::ELEVATED_BG));
@@ -1190,7 +1244,7 @@ fn spawn_image_tile(
     } else {
         entry.file_name.clone()
     };
-    let mut label = commands.spawn((
+    commands.spawn((
         Text::new(display_name),
         TextFont {
             font_size: tokens::TEXT_SIZE_XS,
@@ -1204,9 +1258,6 @@ fn spawn_image_tile(
         },
         ChildOf(tile),
     ));
-    if is_truncated {
-        label.insert((Hovered::default(), Tooltip::title(entry.file_name.clone())));
-    }
     tile
 }
 
@@ -1894,6 +1945,7 @@ fn project_toolbar(icon_font: Handle<Font>) -> impl Bundle {
                 ProjectPathBar,
                 EditorEntity,
                 Node {
+                    min_width: px(0.),
                     flex_direction: FlexDirection::Row,
                     align_items: AlignItems::Center,
                     overflow: Overflow::clip(),
@@ -1942,6 +1994,7 @@ fn project_toolbar(icon_font: Handle<Font>) -> impl Bundle {
                             ),
                         )],
                     ),
+                    view_controls(),
                     assets_folder_button(icon_font),
                 ],
             ),
@@ -2015,6 +2068,323 @@ fn project_columns() -> impl Bundle {
     )
 }
 
+#[operator(
+    id = "project.view",
+    label = "Asset Browser View",
+    description = "Choose gallery or detailed list presentation.",
+    allows_undo = false,
+    params(mode(String, doc = "gallery or list"))
+)]
+fn project_view(
+    params: In<OperatorParameters>,
+    mut state: ResMut<ProjectWindowState>,
+) -> Option<OperatorResult> {
+    let view = match params.as_str("mode")? {
+        "gallery" => BrowserView::Gallery,
+        "list" => BrowserView::List,
+        _ => return None,
+    };
+    state.set_view(view);
+    Some(OperatorResult::Finished)
+}
+
+fn view_controls() -> impl Bundle {
+    (
+        segmented::segmented_bar(),
+        children![
+            (
+                segmented::segment("Gallery"),
+                ViewChoice(BrowserView::Gallery),
+                Checked,
+                Hovered::default(),
+                Tooltip::title("Gallery view")
+            ),
+            (
+                segmented::segment("List"),
+                ViewChoice(BrowserView::List),
+                Hovered::default(),
+                Tooltip::title("List view")
+            ),
+        ],
+    )
+}
+fn on_view_choice(
+    change: On<ValueChange<Entity>>,
+    choices: Query<&ViewChoice>,
+    files: Query<&FileBrowserItem>,
+    mut state: ResMut<ProjectWindowState>,
+    mut commands: Commands,
+) {
+    if let Ok(choice) = choices.get(change.value) {
+        state.set_view(choice.0);
+    } else if let Ok(file) = files.get(change.value) {
+        let path = PathBuf::from(&file.path);
+        commands.queue(move |world: &mut World| select_path(world, &path));
+    }
+}
+fn sync_view_choices(
+    state: Res<ProjectWindowState>,
+    mut commands: Commands,
+    mut choices: Query<(Entity, &ViewChoice, Has<Checked>, &mut BackgroundColor)>,
+    mut grids: Query<(Entity, &mut Node, Has<ListBox>), With<ProjectFileGrid>>,
+) {
+    for (entity, choice, checked, mut background) in &mut choices {
+        let active = choice.0 == state.view;
+        let color = segmented::segment_background(active);
+        if background.0 != color {
+            background.0 = color;
+        }
+        if active != checked {
+            if choice.0 == state.view {
+                commands.entity(entity).insert(Checked);
+            } else {
+                commands.entity(entity).remove::<Checked>();
+            }
+        }
+    }
+    for (entity, mut node, list_box) in &mut grids {
+        if (state.view == BrowserView::List) != list_box {
+            if state.view == BrowserView::List {
+                commands.entity(entity).insert(ListBox);
+            } else {
+                commands.entity(entity).remove::<ListBox>();
+            }
+        }
+        let direction = if state.view == BrowserView::List {
+            FlexDirection::Column
+        } else {
+            FlexDirection::Row
+        };
+        if node.flex_direction != direction {
+            node.flex_direction = direction;
+            node.flex_wrap = if state.view == BrowserView::List {
+                FlexWrap::NoWrap
+            } else {
+                FlexWrap::Wrap
+            };
+            node.align_items = AlignItems::Stretch;
+        }
+    }
+}
+fn reveal_selected_entry(
+    mut state: ResMut<ProjectWindowState>,
+    files: Query<(
+        &FileBrowserItem,
+        &ComputedNode,
+        &bevy::ui::UiGlobalTransform,
+    )>,
+    mut grids: Query<
+        (
+            &ComputedNode,
+            &bevy::ui::UiGlobalTransform,
+            &mut ScrollPosition,
+        ),
+        With<ProjectFileGrid>,
+    >,
+) {
+    if !state.reveal_selection {
+        return;
+    }
+    let Some(selected) = state.selected_file.as_deref() else {
+        state.reveal_selection = false;
+        return;
+    };
+    let Some((_, item, at)) = files.iter().find(|(file, _, _)| file.path == selected) else {
+        return;
+    };
+    let Ok((grid, center, mut scroll)) = grids.single_mut() else {
+        return;
+    };
+    let top = center.translation.y - grid.size().y * 0.5;
+    let bottom = center.translation.y + grid.size().y * 0.5;
+    let item_top = at.translation.y - item.size().y * 0.5;
+    let item_bottom = at.translation.y + item.size().y * 0.5;
+    let delta = if item_top < top {
+        item_top - top
+    } else if item_bottom > bottom {
+        item_bottom - bottom
+    } else {
+        0.
+    };
+    let max = ((grid.content_size().y - grid.size().y) * grid.inverse_scale_factor()).max(0.);
+    scroll.y = (scroll.y + delta * grid.inverse_scale_factor()).clamp(0., max);
+    state.reveal_selection = false;
+}
+
+fn modified_label(modified: Option<SystemTime>) -> String {
+    modified.map_or_else(
+        || "—".into(),
+        |value| {
+            chrono::DateTime::<chrono::Utc>::from(value)
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string()
+        },
+    )
+}
+fn list_text(text: impl Into<String>, width: Val, grow: f32) -> impl Bundle {
+    (
+        Text::new(text),
+        TextLayout {
+            linebreak: bevy::text::LineBreak::AnyCharacter,
+            ..default()
+        },
+        TextFont {
+            font_size: tokens::TEXT_SIZE_SM,
+            ..default()
+        },
+        TextColor(tokens::TEXT_SECONDARY),
+        Node {
+            width,
+            flex_grow: grow,
+            min_width: px(0.),
+            max_width: percent(100),
+            flex_shrink: if grow == 0. { 0. } else { 1. },
+            ..default()
+        },
+        Pickable::IGNORE,
+    )
+}
+fn list_row_node() -> Node {
+    Node {
+        width: percent(100),
+        min_height: px(48.),
+        flex_shrink: 0.,
+        flex_direction: FlexDirection::Row,
+        align_items: AlignItems::Center,
+        column_gap: px(tokens::SPACING_MD),
+        padding: UiRect::all(px(tokens::SPACING_SM)),
+        ..default()
+    }
+}
+fn spawn_list_header(commands: &mut Commands, grid: Entity) {
+    let header = commands
+        .spawn((
+            list_row_node(),
+            children![
+                list_text("Thumbnail", px(72.), 0.),
+                list_text("Name", px(0.), 1.),
+                list_text("Last modified", px(200.), 0.),
+            ],
+        ))
+        .id();
+    jackdaw_feathers::utils::attach_or_despawn(commands, grid, header);
+}
+fn spawn_list_tile(
+    commands: &mut Commands,
+    entry: &DirEntry,
+    kinds: &AssetKinds,
+    font: &IconFont,
+    renaming: bool,
+) -> Entity {
+    let item = FileBrowserItem {
+        path: entry.path.to_string_lossy().into(),
+        is_directory: entry.is_directory,
+        file_name: entry.file_name.clone(),
+    };
+    let row = commands
+        .spawn((
+            item,
+            jackdaw_feathers::list_view::list_row(),
+            list_row_node(),
+            BackgroundColor(Color::NONE),
+        ))
+        .id();
+    let slot = commands
+        .spawn((
+            Node {
+                width: px(72.),
+                flex_shrink: 0.,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            ChildOf(row),
+        ))
+        .id();
+    let picture = commands
+        .spawn((
+            Node {
+                width: px(crate::thumbnail::THUMBNAIL_DISPLAY_SIZE),
+                height: px(crate::thumbnail::THUMBNAIL_DISPLAY_SIZE),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            ChildOf(slot),
+        ))
+        .id();
+    if let Some(image) = entry
+        .texture_info
+        .as_ref()
+        .and_then(|info| info.image_handle.as_ref())
+    {
+        commands.spawn((
+            ImageNode::new(image.clone()),
+            Node {
+                width: percent(100),
+                height: percent(100),
+                ..default()
+            },
+            Pickable::IGNORE,
+            ChildOf(picture),
+        ));
+    } else {
+        if let Some(subject) = tile_subject(entry, kinds) {
+            commands
+                .entity(picture)
+                .insert(crate::thumbnail::ThumbnailSlot::new(
+                    entry.path.clone(),
+                    subject,
+                ));
+        }
+        let icon = if entry.is_directory {
+            icons::Icon::Folder
+        } else if entry.is_prefab() {
+            icons::Icon::Package
+        } else {
+            file_browser::file_icon(&entry.file_name)
+        };
+        commands.spawn((
+            Text::new(String::from(icon.unicode())),
+            TextFont {
+                font: font.0.clone().into(),
+                font_size: tokens::ICON_LG,
+                ..default()
+            },
+            TextColor(tokens::FILE_ICON_COLOR),
+            Pickable::IGNORE,
+            ChildOf(picture),
+        ));
+    }
+    let name = commands
+        .spawn((
+            Node {
+                flex_grow: 1.,
+                flex_basis: px(0.),
+                min_width: px(0.),
+                flex_direction: FlexDirection::Column,
+                ..default()
+            },
+            ChildOf(row),
+        ))
+        .id();
+    if renaming {
+        commands.spawn((rename_field(&entry.path), ChildOf(name)));
+    } else {
+        commands.spawn((
+            list_text(entry.file_name.clone(), percent(100), 0.),
+            ChildOf(name),
+        ));
+    }
+    if let Some(folder) = &entry.folder {
+        attach_folder_caption(commands, name, &entry.path, folder);
+    }
+    commands.spawn((
+        list_text(modified_label(entry.modified), px(200.), 0.),
+        ChildOf(row),
+    ));
+    row
+}
+
 fn on_kind_filter_change(
     event: On<ComboBoxChangeEvent>,
     menus: Query<(), With<ProjectKindFilterMenu>>,
@@ -2037,6 +2407,7 @@ fn on_kind_filter_change(
 pub(crate) fn add_to_extension(ctx: &mut ExtensionContext) {
     ctx.register_operator::<ProjectSelectOp>()
         .register_operator::<ProjectOpenOp>()
+        .register_operator::<ProjectViewOp>()
         .register_operator::<ProjectFilterOp>()
         .register_operator::<ProjectSearchOp>()
         .register_operator::<ProjectRevealOp>()
@@ -2372,6 +2743,65 @@ mod tests {
             texture_info: None,
             kind,
             folder: None,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn asset_browser_views_preserve_state_and_full_filename_hover() {
+        let mut state = ProjectWindowState::at("/project/assets");
+        let file = entry(
+            "🌱🌱🌱🌱🌱🌱🌱🌱_complete_filename.txt",
+            AssetFileKind::Scene,
+        );
+        state.entries.push(file.clone());
+        state.selected_file = Some(file.path.to_string_lossy().into());
+        state.search = "complete".into();
+        state.renaming = Some(file.path.clone());
+        state.needs_refresh = false;
+        for mode in [BrowserView::List, BrowserView::Gallery] {
+            state.set_view(mode);
+            assert_eq!(state.view, mode);
+            assert_eq!(state.entries.len(), 1);
+            assert_eq!(state.search, "complete");
+            assert_eq!(state.selected_file.as_deref(), file.path.to_str());
+            assert_eq!(state.renaming.as_deref(), Some(file.path.as_path()));
+            assert!(
+                !state.needs_refresh,
+                "changing presentation must not rescan"
+            );
+        }
+        assert_eq!(modified_label(None), "—");
+        assert_eq!(
+            modified_label(Some(SystemTime::UNIX_EPOCH)),
+            "1970-01-01 00:00 UTC"
+        );
+        let mut world = World::new();
+        let parent = world.spawn(Node::default()).id();
+        for mode in [BrowserView::Gallery, BrowserView::List] {
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            let tile = spawn_tile(
+                &mut Commands::new(&mut queue, &world),
+                parent,
+                &file,
+                &AssetKinds::default(),
+                &IconFont(Handle::default()),
+                false,
+                false,
+                mode,
+            );
+            queue.apply(&mut world);
+            world.flush();
+            assert_eq!(world.get::<Tooltip>(tile).unwrap().title, file.file_name);
+            assert!(world.get::<Hovered>(tile).is_some());
+            if mode == BrowserView::List {
+                assert!(
+                    world
+                        .query::<&Text>()
+                        .iter(&world)
+                        .any(|text| text.0 == file.file_name)
+                );
+            }
         }
     }
 
