@@ -60,6 +60,10 @@ struct HighlightedEntity(Option<Entity>);
 #[derive(Resource, Default)]
 struct PieStreamState {
     sent_initial: bool,
+    /// The change tick and wall time of the last delta scan: only entities with a
+    /// component changed since then are re-serialized, at most `SCAN_INTERVAL` apart.
+    last_scan: Option<bevy::ecs::change_detection::Tick>,
+    scanned_at: Option<std::time::Instant>,
     /// Last-sent component values keyed by entity bits then type path.
     last_sent: std::collections::HashMap<u64, std::collections::HashMap<String, serde_json::Value>>,
 }
@@ -148,10 +152,28 @@ fn lift_scene_node_id(
 ///     whose serialized value differs from the last-sent value.
 ///   - Bits present in `last_sent` but absent from the current set: emit
 ///     `EntityDespawned` (reliable) and drop from `last_sent`.
+/// The live outliner and inspector need not follow the game at its frame rate.
+const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn stream_state(world: &mut World) {
     if !world.contains_non_send::<PieTransportRes>() {
         return;
     }
+    // Reflect-serializing every streamed entity's every component each frame held
+    // the game to ~10 fps in a 1,600-entity scene. Deltas now scan at most every
+    // `SCAN_INTERVAL` and re-serialize only entities changed since the last scan.
+    let now = std::time::Instant::now();
+    {
+        let state = world.resource::<PieStreamState>();
+        if state.sent_initial
+            && state
+                .scanned_at
+                .is_some_and(|at| now.duration_since(at) < SCAN_INTERVAL)
+        {
+            return;
+        }
+    }
+    let this_run = world.read_change_tick();
 
     let sent_initial = world.resource::<PieStreamState>().sent_initial;
 
@@ -196,15 +218,40 @@ fn stream_state(world: &mut World) {
         let mut pie_state = world.resource_mut::<PieStreamState>();
         pie_state.sent_initial = true;
         pie_state.last_sent = new_last_sent;
+        pie_state.last_scan = Some(this_run);
+        pie_state.scanned_at = Some(now);
         return;
     }
 
     let current_bits: std::collections::HashSet<u64> =
         entities.iter().map(|e| e.to_bits()).collect();
 
+    // New entities, and entities with any component added or changed since the last
+    // scan; the rest are as last sent.
+    let changed: Vec<Entity> = {
+        let state = world.resource::<PieStreamState>();
+        let last_run = state
+            .last_scan
+            .unwrap_or_else(|| bevy::ecs::change_detection::Tick::new(0));
+        entities
+            .iter()
+            .copied()
+            .filter(|&entity| {
+                if !state.last_sent.contains_key(&entity.to_bits()) {
+                    return true;
+                }
+                let entity_ref = world.entity(entity);
+                entity_ref.archetype().components().iter().any(|&id| {
+                    entity_ref
+                        .get_change_ticks_by_id(id)
+                        .is_some_and(|ticks| ticks.is_changed(last_run, this_run))
+                })
+            })
+            .collect()
+    };
     let snapshots = {
         let registry = registry.read();
-        build_snapshot(world, &registry, &entities)
+        build_snapshot(world, &registry, &changed)
     };
 
     let mut spawn_frames: Vec<Vec<u8>> = Vec::new();
@@ -266,6 +313,8 @@ fn stream_state(world: &mut World) {
     }
 
     let mut pie_state = world.resource_mut::<PieStreamState>();
+    pie_state.last_scan = Some(this_run);
+    pie_state.scanned_at = Some(now);
     for (bits, components) in updates {
         pie_state.last_sent.insert(bits, components);
     }
