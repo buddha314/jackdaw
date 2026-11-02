@@ -52,6 +52,86 @@ fn apply_template_lays_its_shapes_from_the_origin() {
 }
 
 #[test]
+fn apply_template_lays_each_shape_on_the_cell_its_order_names() {
+    let (mut app, dir) = overworld();
+    let params = [
+        ("inner", "11"),
+        ("outer", "2"),
+        ("template", "corner2x2"),
+        ("origin", "10,0"),
+        ("order", "3,-,0,2"),
+    ];
+    let (before, after) = edit(&mut app, &dir, "tileset.apply_template", &params);
+    let shapes = LayoutTemplate::Corner2x2.tiles(WATER, GROUND);
+    for (tile, shape) in [(38, 0), (10, 2), (37, 3)] {
+        assert_eq!(
+            peers_of(&after, tile),
+            Some(shapes[shape].peers),
+            "tile {tile}"
+        );
+    }
+    assert_eq!(
+        peers_of(&after, 11),
+        peers_of(&before, 11),
+        "a skipped tile is kept"
+    );
+    let apply = "tileset.apply_template";
+    let at = |order| {
+        [
+            ("inner", "11"),
+            ("outer", "2"),
+            ("template", "corner2x2"),
+            ("origin", "10,0"),
+            ("order", order),
+        ]
+    };
+    refused(&mut app, &dir, apply, &at("0,1,2"), "one block cell per");
+    refused(&mut app, &dir, apply, &at("0,0,1,2"), "each at most once");
+    refused(&mut app, &dir, apply, &at("0,1,2,4"), "one block cell per");
+    refused(&mut app, &dir, apply, &at("a,1,2,3"), "block cells like");
+}
+
+#[test]
+fn apply_template_takes_a_block_size_and_a_placement() {
+    let (mut app, dir) = overworld();
+    let params = [
+        ("inner", "11"),
+        ("outer", "2"),
+        ("template", "corner16"),
+        ("origin", "10,0"),
+        ("size", "8,2"),
+    ];
+    let (_, after) = edit(&mut app, &dir, "tileset.apply_template", &params);
+    let shapes = LayoutTemplate::Corner16.tiles(WATER, GROUND);
+    assert_eq!(peers_of(&after, 17), Some(shapes[7].peers), "row by row");
+    assert_eq!(
+        peers_of(&after, 37),
+        Some(shapes[8].peers),
+        "then the next row"
+    );
+    assert!(reports(&app).iter().any(|r| r.contains("laid on 16 tiles")));
+
+    let apply = "tileset.apply_template";
+    let walls = [
+        ("inner", "11"),
+        ("outer", "2"),
+        ("template", "corner16"),
+        ("origin", "10,0"),
+        ("placement", "on_cells"),
+    ];
+    refused(&mut app, &dir, apply, &walls, "not drawn");
+    let mut short = params;
+    short[4] = ("size", "4,3");
+    call(&mut app, apply, &short);
+    assert!(
+        reports(&app)
+            .iter()
+            .any(|r| r.contains("4 template tiles fall past")),
+        "{:?}",
+        reports(&app)
+    );
+}
+#[test]
 fn reset_to_auto_hands_a_tile_back_to_the_proposal() {
     let (mut app, dir) = overworld();
     let tile = tile_of(&on_disk(&dir), GROUND);
@@ -198,8 +278,8 @@ fn describe_reports_the_overworld_tileset_without_history() {
         "  terrain 6 \"grass 4\": swatch #555d47, background, collision passable",
         "  terrain 11 \"water\": swatch #06a1b3, collision passable",
         "terrain sets: 6",
-        "  set \"grass 2\" over \"grass\": CornersAndSides, 34/47 shapes, missing ",
-        "  set \"water\" over \"grass\": CornersAndSides, 29/47 shapes, missing ",
+        "  set \"grass 2\" over \"grass\": CornersAndSides, 35/47 shapes, missing ",
+        "  set \"water\" over \"grass\": CornersAndSides, 30/47 shapes, missing ",
         "flagged tiles: 0",
         "objects: 34",
         "  object on sheet 0 at 0,4: 5x3, 14 tiles, pivot 0.5,0",

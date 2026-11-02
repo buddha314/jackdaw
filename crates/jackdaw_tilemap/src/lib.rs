@@ -6,6 +6,7 @@
 //! layer origin, and cells are half-open `[min, max)` so a point exactly on
 //! an edge belongs to the cell whose min corner it is.
 
+mod block_fit;
 mod collision_trace;
 mod data_path;
 mod grid;
@@ -22,10 +23,12 @@ mod slice;
 mod solver;
 mod stamp;
 mod strip;
+mod suggest;
 mod template;
 mod terrain_find;
 mod tile;
 
+pub use block_fit::{BlockEvidence, BlockFit, TerrainLook, fit_block};
 pub use collision_trace::{SolidMask, TileShape, solid_mask, trace_mask, trace_proposal};
 pub use data_path::{DataPathError, EXTENSION, mint_data_path, resolve_path};
 pub use grid::{
@@ -46,7 +49,7 @@ pub use report::{
 };
 pub use setup::{
     CollisionMode, Provenance, Scope, SetupSet, SetupTerrain, SetupTile, TilesetSetup, Tracked,
-    rerun, reset_to_auto,
+    fits, rerun, reset_to_auto, solver_takes,
 };
 pub use setup_layout::Coverage;
 pub use sidecar::{
@@ -63,7 +66,10 @@ pub use solver::{
 };
 pub use stamp::{Stamp, find_stamps, reconcile};
 pub use strip::{AnimationStrip, FrameRun, LOOSE_FRAME_MATCH, detect_animation, pair_animations};
-pub use template::LayoutTemplate;
+pub use suggest::{
+    LayoutGuess, MIN_OBJECT, Suggestion, SuggestionKind, suggest_blocks, taken_tiles,
+};
+pub use template::{LayoutTemplate, PaintPreview};
 pub use terrain_find::{
     FoundTerrain, SheetInput, TerrainAnalysis, TileAddress, TileKind, TileLabels, find_terrains,
 };
