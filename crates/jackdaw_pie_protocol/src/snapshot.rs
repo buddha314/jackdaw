@@ -209,7 +209,17 @@ pub fn build_snapshot(
             let entity_ref = world.entity(entity);
             let mut components = HashMap::new();
 
-            for registration in registry.iter() {
+            // Only the components this entity has: walking the whole type registry
+            // for every entity made each snapshot cost entities x registered types.
+            for &id in entity_ref.archetype().components() {
+                let Some(registration) = world
+                    .components()
+                    .get_info(id)
+                    .and_then(|info| info.type_id())
+                    .and_then(|type_id| registry.get(type_id))
+                else {
+                    continue;
+                };
                 let type_path = registration.type_info().type_path_table().path();
 
                 if should_skip(type_path) {
