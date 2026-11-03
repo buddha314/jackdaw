@@ -276,6 +276,7 @@ impl JackdawExtension for JackdawCoreExtension {
         crate::brush::topology_ops::vertex_bevel::add_to_extension(ctx);
         crate::brush::topology_ops::edge_slide::add_to_extension(ctx);
         crate::brush::topology_ops::edge_slide_modal::add_to_extension(ctx);
+        crate::brush::topology_ops::select_elements::add_to_extension(ctx);
         crate::brush::topology_ops::select_invert::add_to_extension(ctx);
         crate::brush::topology_ops::select_less::add_to_extension(ctx);
         crate::brush::topology_ops::select_linked::add_to_extension(ctx);
@@ -292,6 +293,8 @@ impl JackdawExtension for JackdawCoreExtension {
         crate::modifier_ops::add_to_extension(ctx);
         crate::brush::topology_ops::subdivide::add_to_extension(ctx);
         crate::brush::topology_ops::vertex_slide::add_to_extension(ctx);
+        crate::brush::topology_ops::element_transform::add_to_extension(ctx);
+        crate::brush::topology_ops::randomize::add_to_extension(ctx);
         crate::brush::topology_ops::vertex_slide_modal::add_to_extension(ctx);
         crate::brush::topology_ops::weld_selected::add_to_extension(ctx);
         crate::brush::topology_ops::uv_reset_axes::add_to_extension(ctx);
@@ -351,6 +354,8 @@ impl JackdawExtension for JackdawCoreExtension {
         crate::document_ops::add_to_extension(ctx);
         crate::dock_ops::add_to_extension(ctx);
         crate::remote_ops::add_to_extension(ctx);
+        crate::tags::add_to_extension(ctx);
+        crate::recipes::add_to_extension(ctx);
     }
 }
 

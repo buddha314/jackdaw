@@ -1,11 +1,5 @@
 //! The inspector: value editing, panel width, the preview guard and the
 //! bindings card.
-//!
-//! Each module below was its own test binary. Merged, the editor
-//! links once for the theme rather than once per file.
-
-#[path = "../util/mod.rs"]
-mod util;
 
 mod asset_row;
 mod bindings_card;
@@ -29,6 +23,7 @@ mod scene_data_cards;
 mod schema_definition_card;
 mod selection_switch;
 mod sprite_card;
+mod tag_chips;
 mod typed_entry;
 mod unloaded_component_card;
 mod widget_cards;

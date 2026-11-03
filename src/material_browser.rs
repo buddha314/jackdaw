@@ -34,45 +34,48 @@ pub struct MaterialBrowserPlugin;
 
 impl Plugin for MaterialBrowserPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(crate::material_assets::plugin)
-            .init_resource::<MaterialBrowserState>()
-            .init_resource::<MaterialPreviewState>()
-            .init_resource::<MaterialRegistry>()
-            .init_resource::<DetectedTextureSets>()
-            .init_resource::<UnboundTextureSets>()
-            .add_systems(
-                OnEnter(crate::AppState::Editor),
-                (
-                    |world: &mut World| crate::asset_catalog::load_catalog(world),
-                    restart_texture_set_scan,
-                    rebuild_material_registry,
-                )
-                    .chain()
-                    .after(crate::asset_index::open_asset_index),
+        app.add_plugins((
+            crate::material_assets::plugin,
+            crate::material_palette::plugin,
+        ))
+        .init_resource::<MaterialBrowserState>()
+        .init_resource::<MaterialPreviewState>()
+        .init_resource::<MaterialRegistry>()
+        .init_resource::<DetectedTextureSets>()
+        .init_resource::<UnboundTextureSets>()
+        .add_systems(
+            OnEnter(crate::AppState::Editor),
+            (
+                |world: &mut World| crate::asset_catalog::load_catalog(world),
+                restart_texture_set_scan,
+                rebuild_material_registry,
             )
-            .add_systems(
-                Update,
-                (
-                    follow_asset_index
-                        .run_if(resource_changed::<crate::asset_index::AssetIndex>)
-                        .before(rescan_material_definitions),
-                    start_texture_set_scan
-                        .run_if(resource_changed::<crate::asset_index::AssetWalks>)
-                        .before(finish_texture_set_scan),
-                    finish_texture_set_scan.before(rescan_material_definitions),
-                    rescan_material_definitions,
-                    apply_material_filter,
-                    update_material_browser_ui.after(rescan_material_definitions),
-                    update_preview_area,
-                    poll_material_save_folder,
-                    bind_texture_sets_in_use
-                        .run_if(|unbound: Res<UnboundTextureSets>| !unbound.0.is_empty())
-                        .after(rescan_material_definitions),
-                )
-                    .run_if(in_state(crate::AppState::Editor)),
+                .chain()
+                .after(crate::asset_index::open_asset_index),
+        )
+        .add_systems(
+            Update,
+            (
+                follow_asset_index
+                    .run_if(resource_changed::<crate::asset_index::AssetIndex>)
+                    .before(rescan_material_definitions),
+                start_texture_set_scan
+                    .run_if(resource_changed::<crate::asset_index::AssetWalks>)
+                    .before(finish_texture_set_scan),
+                finish_texture_set_scan.before(rescan_material_definitions),
+                rescan_material_definitions,
+                apply_material_filter,
+                update_material_browser_ui.after(rescan_material_definitions),
+                update_preview_area,
+                poll_material_save_folder,
+                bind_texture_sets_in_use
+                    .run_if(|unbound: Res<UnboundTextureSets>| !unbound.0.is_empty())
+                    .after(rescan_material_definitions),
             )
-            .add_observer(handle_apply_material)
-            .add_observer(handle_select_material_preview);
+                .run_if(in_state(crate::AppState::Editor)),
+        )
+        .add_observer(handle_apply_material)
+        .add_observer(handle_select_material_preview);
     }
 }
 
@@ -87,6 +90,8 @@ pub struct MaterialBrowserState {
 #[derive(Event, Clone)]
 pub struct ApplyMaterialDefToFaces {
     pub material: WornMaterial,
+    /// The entities to dress, in place of the selection and its faces.
+    pub entities: Option<Vec<Entity>>,
 }
 
 #[derive(Event, Clone)]
@@ -479,7 +484,10 @@ fn handle_apply_material(
         .active_sub()
         .map(|s| s.faces.clone())
         .unwrap_or_default();
-    if *edit_mode == EditMode::BrushEdit(BrushEditMode::Face) && !active_faces.is_empty() {
+    if event.entities.is_none()
+        && *edit_mode == EditMode::BrushEdit(BrushEditMode::Face)
+        && !active_faces.is_empty()
+    {
         let Some(standard) = event.material.standard().cloned() else {
             warn!("material.apply: a brush face takes a standard material only");
             return;
@@ -507,9 +515,12 @@ fn handle_apply_material(
             });
         }
     } else {
-        let selected = selection.entities.to_vec();
+        let selected = event
+            .entities
+            .clone()
+            .unwrap_or_else(|| selection.entities.to_vec());
         let targets: Vec<Entity> = crate::brush::shown_edit_brushes(
-            &selection.entities,
+            &selected,
             |e| brushes.contains(e),
             |e| {
                 children_query
@@ -1009,6 +1020,32 @@ pub fn material_browser_panel(icon_font: Handle<Font>) -> impl Bundle {
                     ..Default::default()
                 },
             ),
+            (
+                crate::material_palette::MaterialPresetRow,
+                EditorEntity,
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    width: Val::Percent(100.0),
+                    padding: UiRect::horizontal(Val::Px(tokens::SPACING_MD)),
+                    column_gap: Val::Px(tokens::SPACING_XS),
+                    row_gap: Val::Px(tokens::SPACING_XS),
+                    flex_shrink: 0.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                crate::material_palette::MaterialPaletteSection,
+                EditorEntity,
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    width: Val::Percent(100.0),
+                    padding: UiRect::axes(Val::Px(tokens::SPACING_MD), Val::Px(tokens::SPACING_XS)),
+                    row_gap: Val::Px(tokens::SPACING_XS),
+                    flex_shrink: 0.0,
+                    ..Default::default()
+                },
+            ),
             // Editing sections for the previewed material.
             (
                 PreviewAreaContainer,
@@ -1079,32 +1116,62 @@ pub(crate) fn add_to_extension(ctx: &mut ExtensionContext) {
         .register_operator::<MaterialSelectOp>()
         .register_operator::<MaterialApplyOp>()
         .register_operator::<MaterialRescanOp>()
-        .register_operator::<MaterialSaveAsOp>();
+        .register_operator::<MaterialSaveAsOp>()
+        .register_operator::<crate::material_params::MaterialSetOp>();
+    crate::material_palette::add_to_extension(ctx);
 }
 
-/// Create a fresh empty material and select it for preview. It stays unsaved
-/// until `material.save` writes a file for it.
+/// Create a material from a preset and field values, save it, select it for
+/// preview and report its name.
 #[operator(
     id = "material.create",
+    writes_disk = true,
     label = "New Material",
-    description = "Create a fresh empty material."
+    description = "Create a material from a preset and values, save it and report its name.",
+    params(
+        name(
+            String,
+            doc = "Name to save it under. Defaults to the preset's name, else Material_N."
+        ),
+        preset(
+            String,
+            doc = "Values to start from: stone, timber, plaster, thatch, shingle, cobble, \
+                   foliage, water, metal or glass."
+        ),
+        base_color(
+            String,
+            doc = "Colour as #rrggbb, #rrggbbaa or sRGB r,g,b[,a] from 0 to 1."
+        ),
+        roughness(f64, doc = "Roughness from 0 (polished) to 1 (matte)."),
+        metallic(f64, doc = "Metallic from 0 to 1."),
+        emissive(String, doc = "Glow as #rrggbb or linear r,g,b, which may exceed 1."),
+        alpha(
+            f64,
+            doc = "Opacity from 0 to 1; below 1 blends. Wins over the colour's own alpha."
+        ),
+        texture(String, doc = "Base colour image, as a path under the assets folder."),
+        uv_scale(String, doc = "Texture tiling: one number, or u,v."),
+        path(
+            String,
+            doc = "Folder or file to save it to. Defaults to assets/materials."
+        ),
+        palette(
+            String,
+            doc = "A palette name to bind it to in the active palette, such as roof."
+        ),
+    )
 )]
-pub(crate) fn material_create(
-    _: In<OperatorParameters>,
-    mut registry: ResMut<MaterialRegistry>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut catalog: ResMut<crate::asset_catalog::AssetCatalog>,
-    mut preview_state: ResMut<MaterialPreviewState>,
-) -> OperatorResult {
-    let name = registry.next_created_name();
-    let handle = materials.add(StandardMaterial::default());
-    catalog.insert(format!("@{name}"), handle.clone().untyped());
-    registry.add(name, handle.clone());
-    preview_state.active_material = Some(handle);
-    preview_state.orbit_yaw = 0.5;
-    preview_state.orbit_pitch = -0.3;
-    preview_state.zoom_distance = 3.0;
-    OperatorResult::Finished
+pub(crate) fn material_create(params: In<OperatorParameters>, world: &mut World) -> OperatorResult {
+    match crate::material_params::create_material(world, &params) {
+        Ok(name) => {
+            report_to_caller(world, name);
+            set_outcome(world, Outcome::Changed);
+            OperatorResult::Finished
+        }
+        Err(why) => {
+            crate::brush::topology_ops::select_elements::refuse(world, "material.create", why)
+        }
+    }
 }
 
 /// Load a named material into the shared preview.
@@ -1118,7 +1185,7 @@ pub(crate) fn material_create(
     allows_undo = false,
     params(material(
         String,
-        doc = "Path of the material file to preview, such as \
+        doc = "Palette name or path of the material file to preview, such as roof or \
                materials/slate.bsn. A bare name still resolves for one release."
     ))
 )]
@@ -1150,20 +1217,42 @@ pub(crate) fn material_select(
     label = "Apply Material",
     description = "Apply a material to the selected faces or brushes.",
     allows_undo = false,
-    params(material(
-        String,
-        doc = "Path of the material file to apply, such as \
-               materials/slate.material.bsn. A bare name still resolves for \
-               one release. Defaults to the previewed one."
-    ))
+    params(
+        material(
+            String,
+            doc = "Palette name or path of the material file to apply, such as roof or \
+                   materials/slate.material.bsn. A bare name still resolves for \
+                   one release. Defaults to the previewed one."
+        ),
+        entities(
+            String,
+            doc = "Entities to dress whole: a list of ids, names, paths or queries such as \
+                   #roof. Defaults to the selected faces or brushes."
+        ),
+    )
 )]
 pub(crate) fn material_apply(
     params: In<OperatorParameters>,
     registry: Res<MaterialRegistry>,
     index: Option<Res<crate::asset_index::AssetIndex>>,
     preview_state: Res<MaterialPreviewState>,
+    selection: Res<Selection>,
+    authored: Query<(), Without<crate::EditorEntity>>,
     mut commands: Commands,
 ) -> OperatorResult {
+    let entities = match params.get("entities") {
+        None => None,
+        Some(_) => match crate::boot_ops::target_entities(&params, &selection, &authored) {
+            Ok(targets) => Some(targets),
+            Err(refusal) => {
+                commands.queue(move |world: &mut World| {
+                    warn_caller(world, format!("material.apply: {refusal}"));
+                    set_outcome(world, Outcome::Invalid);
+                });
+                return OperatorResult::Cancelled;
+            }
+        },
+    };
     let material = match params.as_str("material") {
         Some(reference) => {
             crate::material_assets::worn_of_reference(index.as_deref(), &registry, reference)
@@ -1177,7 +1266,7 @@ pub(crate) fn material_apply(
         warn!("material.apply: no material to apply");
         return OperatorResult::Cancelled;
     };
-    commands.trigger(ApplyMaterialDefToFaces { material });
+    commands.trigger(ApplyMaterialDefToFaces { material, entities });
     OperatorResult::Finished
 }
 
@@ -1199,6 +1288,7 @@ pub(crate) fn material_rescan(
 /// with no folder in mind would put it.
 #[operator(
     id = "material.save_as",
+    writes_disk = true,
     label = "Save Material As",
     description = "Choose the file to write this material to.",
     allows_undo = false

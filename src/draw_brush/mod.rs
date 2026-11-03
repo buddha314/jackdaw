@@ -16,6 +16,8 @@ mod extend_face;
 mod interaction;
 mod plane_math;
 mod preview_mesh;
+mod prism;
+mod revolve;
 mod state;
 
 pub(crate) use self::build::*;
@@ -95,6 +97,7 @@ pub(crate) fn add_to_extension(ctx: &mut ExtensionContext) {
 
     ctx.register_operator::<ActivateDrawBrushModalOp>()
         .register_operator::<AddBrushOp>()
+        .register_operator::<AddRevolveOp>()
         .register_operator::<ConfirmDrawBrushOp>()
         .register_operator::<BrushJoinOp>()
         .register_operator::<BrushCsgSubtractOp>()
@@ -424,11 +427,97 @@ fn is_in_draw_brush_modal(active: ActiveModalQuery) -> bool {
     active.is_operator(ActivateDrawBrushModalOp::ID)
 }
 
-#[operator(id = "mesh.add_brush")]
-pub fn add_brush(_params: In<OperatorParameters>) -> OperatorResult {
-    // TODO: make this add / finalize the geometry that was previewed by the draw model
-    // The reason for this operator to exist is to be called by user extensions.
-    OperatorResult::Finished
+#[operator(
+    id = "mesh.add_brush",
+    label = "Add Brush",
+    description = "Add a brush extruded from an outline of points and arcs, optionally tapered, \
+                   sliced, placed, materialled, named and parented.",
+    allows_undo = false,
+    params(
+        outline(
+            String,
+            doc = "JSON list of [u, v] points and {\"arc\": {\"center\": [u, v], \"radius\", \
+                   \"from_deg\", \"to_deg\", \"segments\"}} items; at least three points, \
+                   concave allowed, not crossing itself. Arc angles turn from +u toward +v and \
+                   default to 8 segments."
+        ),
+        plane(
+            String,
+            doc = "xy, xz or yz: u and v are the first and second axis, the depth runs along \
+                   the third. Defaults to xz."
+        ),
+        depth(
+            f64,
+            doc = "Extrusion, centred on the plane; 0.01 to 10000. Defaults to 1."
+        ),
+        taper(
+            f64,
+            doc = "Scale of the far cap about the outline's centroid, 0 to 1; below 0.001 ends \
+                   in a point. Defaults to 1."
+        ),
+        depth_segments(i64, doc = "Slices along the depth, 1 to 64. Defaults to 1."),
+        pos(Vec3, doc = "Position [x, y, z]. Defaults to the origin."),
+        rot(
+            Vec3,
+            doc = "Rotation [yaw, pitch, roll] in degrees. Defaults to none."
+        ),
+        material(
+            String,
+            doc = "Palette name or material file path for every face. Defaults to the last used."
+        ),
+        parent(Entity, doc = "Node that adopts it. Defaults to top level."),
+        name(String, doc = "Name for the new node. Defaults to \"Brush\"."),
+    )
+)]
+pub fn add_brush(params: In<OperatorParameters>, world: &mut World) -> OperatorResult {
+    self::prism::add_outline_brush(world, &params)
+}
+
+#[operator(
+    id = "mesh.add_revolve",
+    label = "Add Revolve",
+    description = "Add a brush turned from a profile of [radius, height] points around an axis, \
+                   whole or partly, optionally placed, materialled, named and parented.",
+    allows_undo = false,
+    params(
+        profile(
+            String,
+            doc = "JSON list of [radius, height] points, radius 0 or more, at least two, not \
+                   crossing itself. Repeat the first point at the end to close it on itself (a \
+                   torus or ring); otherwise its ends are joined to the axis, with a flat disc \
+                   where an end is off it. Points on the axis become poles."
+        ),
+        segments(i64, doc = "Steps over the swept angle, 3 to 256. Defaults to 12."),
+        angle_deg(
+            f64,
+            doc = "Swept angle in degrees, above 0 up to 360, counter-clockwise looking down \
+                   the axis. Defaults to 360."
+        ),
+        axis(
+            String,
+            doc = "x, y or z: the axis through the origin the height runs along. The turn \
+                   starts from +x (+y for the x axis). Defaults to y."
+        ),
+        caps(
+            String,
+            doc = "auto closes a partial turn and open ends with flat faces; none refuses a \
+                   profile and angle that need them. Defaults to auto."
+        ),
+        pos(Vec3, doc = "Position [x, y, z]. Defaults to the origin."),
+        rot(
+            Vec3,
+            doc = "Rotation [yaw, pitch, roll] in degrees. Defaults to none."
+        ),
+        material(
+            String,
+            doc = "Palette name or material file path for every face. Defaults to the last used."
+        ),
+        parent(Entity, doc = "Node that adopts it. Defaults to top level."),
+        name(String, doc = "Name for the new node. Defaults to \"Brush\"."),
+    )
+)]
+pub fn add_revolve(params: In<OperatorParameters>, world: &mut World) -> OperatorResult {
+    self::revolve::add_revolved_brush(world, &params)
 }
 
 pub(crate) const MIN_FOOTPRINT_SIZE: f32 = 0.01;

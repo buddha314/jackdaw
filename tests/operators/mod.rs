@@ -1,16 +1,17 @@
 //! Operator registration and dispatch: availability, parameters, modals,
 //! tooltips, undo and the id space.
-//!
-//! Each module below was its own test binary. Merged, the editor
-//! links once for the theme rather than once per file.
-
-#[path = "../util/mod.rs"]
-mod util;
 
 mod authoring_ops;
+mod csg_fragments;
+mod csg_ops;
 mod dialog_answer;
+mod element_addressing;
+mod element_transform;
 mod field_edits;
 mod light_defaults;
+mod material_param_ops;
+mod mesh_param_ops;
+mod nested_calls;
 mod operator_availability;
 mod operator_entity_params;
 mod operator_modals;
@@ -21,10 +22,18 @@ mod operator_undo;
 mod param_declarations;
 mod pixel_canvas_ops;
 mod prefab_ops;
+mod primitive_ops;
+mod prism_ops;
+mod randomize_ops;
+mod recipe_ops;
 mod remote_coverage;
+mod rename_ops;
+mod revolve_ops;
 mod scatter_ops;
 mod scene_op_ids;
+mod spawn_param_ops;
 mod sprite_ops;
+mod tag_ops;
 mod tileset_bits;
 mod tileset_browser;
 mod tileset_dock;

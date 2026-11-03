@@ -2,7 +2,9 @@
 //! tileset: each one's effect on the file, its single undo entry, and its
 //! refusals.
 
-use crate::tileset_ops::{SHEET, asset_file, import, project_app, read_tileset, warnings};
+use crate::operators::tileset_ops::{
+    SHEET, asset_file, import, project_app, read_tileset, warnings,
+};
 use crate::util::OperatorResultExt as _;
 
 use bevy::prelude::*;
@@ -141,7 +143,7 @@ pub(crate) fn over_the_remote(app: &mut App, calls: Vec<(&str, serde_json::Value
             .unwrap_or_else(|err| panic!("{id} refused: {}", err.message));
         app.update();
         assert_eq!(outcome["result"], "finished", "{id}: {outcome}");
-        assert_eq!(outcome["warnings"], json!([]), "{id}: {outcome}");
+        assert!(outcome.get("warnings").is_none(), "{id}: {outcome}");
         assert!(
             !outcome["reports"].as_array().expect("reports").is_empty(),
             "{id}"

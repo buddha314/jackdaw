@@ -37,6 +37,7 @@ pub mod definition_assets;
 pub mod draw_brush;
 pub mod edit_mode_ops;
 pub mod entity_ops;
+pub mod entity_refs;
 pub mod environment_ops;
 pub mod face_grid;
 pub use jackdaw_runtime::frame_work;
@@ -101,6 +102,8 @@ pub mod lod_upgrade;
 pub mod material_assets;
 pub mod material_browser;
 pub mod material_overrides;
+pub mod material_palette;
+pub mod material_params;
 pub mod material_preview;
 pub mod material_ui;
 pub mod measure_tool;
@@ -112,6 +115,7 @@ pub mod modifier_ops;
 pub mod module_picker;
 pub mod native_dialog;
 pub mod new_project;
+pub(crate) mod node_ops;
 pub mod numeric_transform;
 pub mod operator_tooltip;
 pub mod perf_probe;
@@ -124,6 +128,7 @@ pub mod prefab;
 pub mod preflight;
 pub mod preview_context;
 pub(crate) mod preview_model;
+pub(crate) mod primitive_ops;
 pub mod probe_bake;
 pub mod progress;
 pub mod project;
@@ -134,6 +139,7 @@ pub mod project_select;
 pub mod project_settings;
 pub mod project_types;
 pub mod project_window;
+pub mod recipes;
 pub mod reference_image;
 pub mod reflect_default;
 pub mod remote;
@@ -161,6 +167,7 @@ pub mod sprite_props;
 pub mod sprite_snap;
 pub mod sprite_stage;
 pub mod status_bar;
+pub mod tags;
 pub mod terrain;
 pub mod test_input;
 pub mod texture_files;
@@ -213,6 +220,7 @@ pub mod viewport_select;
 pub mod viewport_settings;
 pub mod viewport_settings_menu;
 pub mod viewport_util;
+pub mod views;
 pub mod windowing;
 pub mod workspace_dropdown;
 pub mod world_units;
@@ -475,6 +483,8 @@ impl Plugin for EditorCorePlugin {
         .add_plugins(jackdaw_surface::ReflectionProbePlugin)
         .add_plugins(jackdaw_surface::ShadowViewCleanupPlugin)
         .add_plugins(probe_bake::plugin)
+        .add_plugins(tags::plugin)
+        .add_plugins(recipes::plugin)
         .add_plugins(tileset_import::plugin)
         .add_plugins(tilemap::plugin)
         .add_plugins(tile_tools::plugin)
@@ -2436,7 +2446,21 @@ fn populate_menu(
             .or_default();
         append_extension_entries(rows, entries);
     }
-    let menu_items = menu_items.into_values().flatten();
+    let mut menu_items: Vec<(String, Vec<(String, String)>)> =
+        menu_items.into_values().flatten().collect();
+    if brush::topology_ops::select_elements::editing_elements(world) {
+        let at = menu_items
+            .iter()
+            .position(|(id, _)| *id == TopLevelMenu::Edit.id())
+            .map_or(0, |edit| edit + 1);
+        menu_items.insert(
+            at,
+            (
+                "Select".to_string(),
+                brush::topology_ops::select_elements::select_menu_rows(),
+            ),
+        );
+    }
 
     jackdaw_feathers::menu_bar::populate_menu_bar(world, menu_bar_entity, menu_items);
 }

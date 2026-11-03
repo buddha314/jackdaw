@@ -40,6 +40,7 @@ pub(crate) fn plugin(app: &mut App) {
         drive_shot_probe.run_if(in_state(crate::AppState::Editor)),
     );
     crate::camera_capture::plugin(app);
+    crate::views::plugin(app);
 }
 
 /// Captures that have reached the disk, by the path they were written to.
@@ -52,6 +53,19 @@ pub struct CaptureLog {
     landed: bevy::platform::collections::HashMap<PathBuf, (u32, u32)>,
     /// Insertion order, for eviction. Holds the same paths as `landed`.
     order: std::collections::VecDeque<PathBuf>,
+    /// Thumbnails asked for, by the capture path they are made from.
+    wanted: bevy::platform::collections::HashMap<PathBuf, (u32, ThumbnailFormat)>,
+    /// Thumbnails made as their capture landed, or why one was not.
+    thumbnails: bevy::platform::collections::HashMap<PathBuf, Result<Thumbnail, String>>,
+}
+
+/// A thumbnail on disk. Its path is the capture's own when the capture
+/// already fits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Thumbnail {
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl CaptureLog {
@@ -80,6 +94,19 @@ impl CaptureLog {
         if self.landed.remove(path).is_some() {
             self.order.retain(|held| held != path);
         }
+        self.wanted.remove(path);
+        self.thumbnails.remove(path);
+    }
+
+    /// Ask for a thumbnail of the capture that lands at `path`, at most
+    /// `max_px` on its longer side.
+    pub fn want_thumbnail(&mut self, path: PathBuf, max_px: u32, format: ThumbnailFormat) {
+        self.wanted.insert(path, (max_px, format));
+    }
+
+    /// The thumbnail made for the capture at `path`, taken out of the log.
+    pub fn take_thumbnail(&mut self, path: &Path) -> Option<Result<Thumbnail, String>> {
+        self.thumbnails.remove(path)
     }
 }
 
@@ -504,17 +531,25 @@ fn spawn_capture(
                     .map_or(CaptureSurface::Plain, CaptureSurface::of_panel);
                 pending.region.resolve(surface, capture.image.size())
             });
-            let wrote = match kept {
+            let frame = match kept {
                 Some(Err(err)) => {
                     error!("screenshot: {err}");
                     None
                 }
-                Some(Ok(rect)) => write_png_cropped(&capture.image, &path, Some(rect)),
-                None => write_png_cropped(&capture.image, &path, None),
+                Some(Ok(rect)) => cropped_frame(&capture.image, Some(rect)),
+                None => cropped_frame(&capture.image, None),
             };
+            let wrote = frame
+                .as_ref()
+                .and_then(|rgb| save_png(rgb, &path).then(|| rgb.dimensions()));
             if let Some(size) = wrote
+                && let Some(rgb) = &frame
                 && let Some(mut log) = log
             {
+                if let Some((max_px, format)) = log.wanted.remove(&path) {
+                    let thumbnail = write_thumbnail(rgb, &path, max_px, format);
+                    log.thumbnails.insert(path.clone(), thumbnail);
+                }
                 log.record(path.clone(), size);
             }
             if exit_when_done {
@@ -540,6 +575,12 @@ pub(crate) fn write_png_cropped(
     path: &Path,
     crop: Option<URect>,
 ) -> Option<(u32, u32)> {
+    let rgb = cropped_frame(image, crop)?;
+    save_png(&rgb, path).then(|| rgb.dimensions())
+}
+
+/// A captured frame as RGB, keeping only `crop` when given.
+fn cropped_frame(image: &Image, crop: Option<URect>) -> Option<::image::RgbImage> {
     let dynamic = match image.clone().try_into_dynamic() {
         Ok(dynamic) => dynamic,
         Err(err) => {
@@ -559,16 +600,89 @@ pub(crate) fn write_png_cropped(
         None => dynamic,
     };
     // Drop alpha: with HDR on it carries brightness rather than opacity.
-    let rgb = kept.to_rgb8();
+    Some(kept.to_rgb8())
+}
+
+/// Write `rgb` to `path` as a PNG. Returns whether it landed.
+fn save_png(rgb: &::image::RgbImage, path: &Path) -> bool {
     match rgb.save_with_format(path, ::image::ImageFormat::Png) {
         Ok(()) => {
             info!("screenshot: wrote {}", path.display());
-            Some((rgb.width(), rgb.height()))
+            true
         }
         Err(err) => {
             error!("screenshot: cannot write {}: {err}", path.display());
-            None
+            false
         }
+    }
+}
+
+/// The encoding of a screenshot thumbnail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbnailFormat {
+    Png,
+    /// Lossy and smaller; edges blur.
+    Jpeg,
+}
+
+impl ThumbnailFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+        }
+    }
+}
+
+/// A thumbnail of the capture `rgb` written to `capture`, fitted inside
+/// `max_px` on its longer side (never scaled up). A PNG that already fits is
+/// the capture itself; anything else goes beside it as `<stem>.thumb.<ext>`.
+pub fn write_thumbnail(
+    rgb: &::image::RgbImage,
+    capture: &Path,
+    max_px: u32,
+    format: ThumbnailFormat,
+) -> Result<Thumbnail, String> {
+    let fits = rgb.width().max(rgb.height()) <= max_px;
+    if fits && format == ThumbnailFormat::Png {
+        return Ok(Thumbnail {
+            path: capture.to_path_buf(),
+            width: rgb.width(),
+            height: rgb.height(),
+        });
+    }
+    let scaled = if fits {
+        rgb.clone()
+    } else {
+        ::image::DynamicImage::ImageRgb8(rgb.clone())
+            .thumbnail(max_px, max_px)
+            .to_rgb8()
+    };
+    let dest = capture.with_extension(format!("thumb.{}", format.extension()));
+    save_rgb(&scaled, &dest, format)
+        .map_err(|err| format!("cannot write thumbnail {}: {err}", dest.display()))?;
+    Ok(Thumbnail {
+        path: dest,
+        width: scaled.width(),
+        height: scaled.height(),
+    })
+}
+
+/// Write `rgb` to `path` in `format`; JPEG at quality 80.
+pub(crate) fn save_rgb(
+    rgb: &::image::RgbImage,
+    path: &Path,
+    format: ThumbnailFormat,
+) -> Result<(), ::image::ImageError> {
+    match format {
+        ThumbnailFormat::Png => rgb.save_with_format(path, ::image::ImageFormat::Png),
+        ThumbnailFormat::Jpeg => std::fs::File::create(path)
+            .map_err(::image::ImageError::IoError)
+            .and_then(|file| {
+                let mut writer = std::io::BufWriter::new(file);
+                ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 80)
+                    .encode_image(rgb)
+            }),
     }
 }
 
@@ -643,6 +757,7 @@ fn drive_shot_probe(world: &mut World) {
 /// Capture the viewport to a PNG: the world it is showing, or the canvas.
 #[operator(
     id = "viewport.screenshot",
+    writes_disk = true,
     label = "Screenshot Viewport",
     description = "Save what the viewport is showing to a PNG file, or the part of it named \
                    by the region values.",
@@ -687,6 +802,7 @@ pub(crate) fn viewport_screenshot(
 /// alone, without the stage chrome drawn over it.
 #[operator(
     id = "viewport2d.screenshot",
+    writes_disk = true,
     label = "Screenshot 2D Viewport",
     description = "Save what the 2D viewport is showing to a PNG file, without the selection \
                    chrome, or the part of it named by the region values; `window.screenshot` \
@@ -759,6 +875,7 @@ fn run_capture(
 /// Capture the whole editor window to a PNG, `bevy_ui` chrome included.
 #[operator(
     id = "window.screenshot",
+    writes_disk = true,
     label = "Screenshot Window",
     description = "Save the whole editor window, including all UI panels, to a PNG file.",
     allows_undo = false,
