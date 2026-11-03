@@ -1086,6 +1086,16 @@ impl SpawnedEntities {
         std::mem::take(&mut spawned.entities)
     }
 
+    /// Take the list being recorded out, for a call that dispatches calls of
+    /// its own; [`Self::put_back`] restores it.
+    pub(crate) fn set_aside(world: &mut World) -> Self {
+        std::mem::take(&mut *world.get_resource_or_init::<Self>())
+    }
+
+    pub(crate) fn put_back(world: &mut World, held: Self) {
+        *world.get_resource_or_init::<Self>() = held;
+    }
+
     /// Record `entity` as spawned, if anyone is watching.
     pub(crate) fn record(world: &mut World, entity: Entity) {
         if let Some(mut spawned) = world.get_resource_mut::<Self>()
@@ -1453,6 +1463,17 @@ fn bsn_value_string(value: &jackdaw_bsn::BsnValue) -> Option<&str> {
     }
 }
 
+/// Give a scene node a new name, in the document and on the live entity.
+pub(crate) fn rename_scene_node(world: &mut World, entity: Entity, name: &str) {
+    {
+        let mut document = world.resource_mut::<jackdaw_bsn::SceneBsnAst>();
+        if let Some(node) = document.ast_for(entity) {
+            set_name_patch(&mut document, node, Some(name));
+        }
+    }
+    world.entity_mut(entity).insert(Name::new(name.to_string()));
+}
+
 /// Set, replace, or remove the [`jackdaw_bsn::BsnPatch::Name`] patch on a
 /// document node.
 pub(crate) fn set_name_patch(ast: &mut jackdaw_bsn::SceneBsnAst, node: Entity, name: Option<&str>) {
@@ -1489,13 +1510,38 @@ pub(crate) fn set_name_patch(ast: &mut jackdaw_bsn::SceneBsnAst, node: Entity, n
 }
 
 impl SetBsnField {
+    /// A name edit. `authored` is the name the document's `#name` patch holds
+    /// now, `None` when the node has none; `live` is the name it shows now.
+    /// Undo restores `authored`, and when there was no patch it removes the
+    /// patch and puts `live` back on the entity.
+    pub(crate) fn name(
+        entity: Entity,
+        authored: Option<String>,
+        live: Option<String>,
+        new_name: String,
+    ) -> Self {
+        let was_derived = authored.is_none();
+        Self {
+            entity,
+            type_path: NAME_TYPE_PATH.to_string(),
+            field_path: String::new(),
+            old_value: authored.or(live).map(jackdaw_bsn::BsnValue::String),
+            new_value: jackdaw_bsn::BsnValue::String(new_name),
+            was_derived,
+        }
+    }
+
     /// Write an entity name into the document's `#name` reference patch and
     /// mirror it onto the live ECS entity. `None` removes both.
     fn apply_name(&self, world: &mut World, name: Option<&str>) {
+        self.apply_name_split(world, name, name);
+    }
+
+    fn apply_name_split(&self, world: &mut World, doc: Option<&str>, name: Option<&str>) {
         {
             let mut ast = world.resource_mut::<jackdaw_bsn::SceneBsnAst>();
             if let Some(node) = ast.ast_for(self.entity) {
-                set_name_patch(&mut ast, node, name);
+                set_name_patch(&mut ast, node, doc);
             }
         }
         let Ok(mut entity_mut) = world.get_entity_mut(self.entity) else {
@@ -1603,7 +1649,11 @@ impl SetBsnField {
                 .and_then(bsn_value_string)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            self.apply_name(world, old_name.as_deref());
+            if self.was_derived {
+                self.apply_name_split(world, None, old_name.as_deref());
+            } else {
+                self.apply_name(world, old_name.as_deref());
+            }
             return;
         }
         // A missing old value means execute authored something that did not
@@ -3413,14 +3463,7 @@ mod set_bsn_field_tests {
     }
 
     fn name_command(entity: Entity, old: Option<&str>, new: &str) -> SetBsnField {
-        SetBsnField {
-            entity,
-            type_path: NAME_TYPE_PATH.to_string(),
-            field_path: String::new(),
-            old_value: old.map(|s| BsnValue::String(s.to_string())),
-            new_value: BsnValue::String(new.to_string()),
-            was_derived: false,
-        }
+        SetBsnField::name(entity, old.map(str::to_string), None, new.to_string())
     }
 
     #[test]

@@ -4,15 +4,15 @@
 
 use bevy::prelude::*;
 use jackdaw_api::prelude::*;
-use jackdaw_commands::{CommandGroup, EditorCommand};
+use jackdaw_commands::EditorCommand;
 use jackdaw_feathers::dialog::{DialogChoices, EditorDialog, answer_dialog, resolve_dialog_choice};
 
-use crate::commands::{CommandHistory, ReparentEntity, SetBsnField, SetTransform, SpawnEntity};
-use crate::entity_ops::EntityTemplate;
+use crate::commands::{CommandHistory, SetBsnField, SetTransform};
 
 pub(crate) fn add_to_extension(ctx: &mut ExtensionContext) {
     ctx.register_operator::<EntityAddGroupOp>()
         .register_operator::<EntitySetTransformOp>()
+        .register_operator::<EntityRenameOp>()
         .register_operator::<ComponentSetOp>()
         .register_operator::<DialogAnswerOp>();
 }
@@ -62,11 +62,12 @@ fn a_dialog_is_up(dialogs: Query<(), With<EditorDialog>>) -> bool {
     !dialogs.is_empty()
 }
 
-/// Add an empty node, named, optionally under another node, as one undo entry.
+/// Add an empty node, named, placed, optionally under another node, as one
+/// undo entry.
 #[operator(
     id = "entity.add.group",
     label = "Add Group",
-    description = "Add an empty node, named, optionally under another node.",
+    description = "Add an empty node, named, placed, optionally under another node.",
     allows_undo = false,
     params(
         name(String, doc = "Name for the new node. Defaults to \"Group\"."),
@@ -74,75 +75,72 @@ fn a_dialog_is_up(dialogs: Query<(), With<EditorDialog>>) -> bool {
             Entity,
             doc = "Node that adopts it. Left out, top level, or in an open 2D world scene beside a selection inside the scene, else under the scene root."
         ),
+        pos(Vec3, doc = "Position [x, y, z]. Defaults to the origin."),
+        rot(
+            Vec3,
+            doc = "Rotation [yaw, pitch, roll] in degrees. Defaults to none."
+        ),
     )
 )]
 pub(crate) fn entity_add_group(
     params: In<OperatorParameters>,
-    mut commands: Commands,
+    world: &mut World,
 ) -> OperatorResult {
-    let name = params
-        .as_str("name")
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Group")
-        .to_string();
-    let parent = params.as_entity("parent");
-    commands.queue(move |world: &mut World| {
-        // Spawn through the same command `entity.add.empty` pushes, so undo
-        // despawns the node rather than only taking back its rename.
-        let in_2d = crate::sprite_ops::scene_2d_parent(world, None);
-        let mut spawn = SpawnEntity::new(
-            move |world: &mut World| {
-                crate::entity_ops::spawn_template_under(world, EntityTemplate::Empty, in_2d)
-            },
-            "Add Group".to_string(),
-        );
-        spawn.execute(world);
-        let Some(entity) = spawn
-            .spawned
-            .filter(|entity| *entity != Entity::PLACEHOLDER)
-        else {
-            warn_caller(world, "entity.add.group: could not spawn the node");
-            return;
-        };
+    crate::node_ops::add_node(world, &params, crate::node_ops::NodeKind::Group)
+}
 
-        let old_name = world
-            .get::<Name>(entity)
-            .map(|name| jackdaw_bsn::BsnValue::String(name.as_str().to_string()));
-        let mut group: Vec<Box<dyn EditorCommand>> = vec![
-            Box::new(spawn),
-            Box::new(SetBsnField {
-                entity,
-                type_path: crate::commands::NAME_TYPE_PATH.to_string(),
-                field_path: String::new(),
-                old_value: old_name,
-                new_value: jackdaw_bsn::BsnValue::String(name.clone()),
-                was_derived: false,
-            }),
-        ];
-        if let Some(parent) = parent
-            && world.get_entity(parent).is_ok()
-        {
-            group.push(Box::new(ReparentEntity {
-                entity,
-                old_parent: world.get::<ChildOf>(entity).map(ChildOf::parent),
-                new_parent: Some(parent),
-                old_index: None,
-            }));
+/// Rename a scene node through the same document patch the hierarchy and the
+/// inspector commit. An empty name clears `Name`; naming it what it already
+/// is leaves the scene and the history alone.
+#[operator(
+    id = "entity.rename",
+    label = "Rename Entity",
+    description = "Set an entity's name. An empty name clears it.",
+    allows_undo = false,
+    params(
+        entity(Entity, doc = "Scene node to rename."),
+        name(String, doc = "The new name. Empty clears the name."),
+    )
+)]
+pub(crate) fn entity_rename(params: In<OperatorParameters>, world: &mut World) -> OperatorResult {
+    let (entity, new_name) = match read_rename(world, &params) {
+        Ok(request) => request,
+        Err(why) => {
+            warn_caller(world, format!("entity.rename: {why}"));
+            set_outcome(world, Outcome::Invalid);
+            return OperatorResult::Cancelled;
         }
-
-        // The spawn already ran; the rest runs here and the group goes on the
-        // history as one already-executed entry.
-        for command in group.iter_mut().skip(1) {
-            command.execute(world);
-        }
-        world
-            .resource_mut::<CommandHistory>()
-            .push_executed(Box::new(CommandGroup {
-                label: format!("Add Group {name}"),
-                commands: group,
-            }));
-    });
+    };
+    let live = world
+        .get::<Name>(entity)
+        .map(|name| name.as_str().to_string());
+    if live.as_deref().unwrap_or_default() == new_name {
+        set_outcome(world, Outcome::Unchanged);
+        return OperatorResult::Finished;
+    }
+    let authored = {
+        let ast = world.resource::<jackdaw_bsn::SceneBsnAst>();
+        ast.ast_for(entity)
+            .and_then(|node| ast.get_name(node))
+            .map(str::to_string)
+    };
+    let mut command: Box<dyn EditorCommand> =
+        Box::new(SetBsnField::name(entity, authored, live, new_name));
+    command.execute(world);
+    world
+        .resource_mut::<CommandHistory>()
+        .push_executed(command);
+    set_outcome(world, Outcome::Changed);
     OperatorResult::Finished
+}
+
+fn read_rename(world: &World, params: &OperatorParameters) -> Result<(Entity, String), String> {
+    let entity = params
+        .as_entity("entity")
+        .ok_or("`entity` names no entity")?;
+    crate::primitive_ops::scene_node(world, entity, "entity")?;
+    let name = params.as_str("name").ok_or("`name` must be text")?;
+    Ok((entity, name.to_string()))
 }
 
 /// Place an entity: position, rotation in degrees, scale. Every field is

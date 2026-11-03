@@ -91,6 +91,16 @@ pub struct CommandHistory {
     /// so an enclosing span counts an inner span once rather than once
     /// per entry the inner span collapsed.
     pushes: u64,
+    /// Which state of the document the history last left, drawn from one
+    /// process-wide counter so no two histories ever share a value.
+    revision: u64,
+}
+
+/// The source of every [`CommandHistory::revision`].
+static NEXT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Where the undo stack stood when a span was opened. Hand it back to
@@ -105,6 +115,7 @@ impl Default for CommandHistory {
             redo_stack: Vec::new(),
             budget_bytes: HISTORY_BUDGET_BYTES,
             pushes: 0,
+            revision: next_revision(),
         }
     }
 }
@@ -114,8 +125,22 @@ impl CommandHistory {
         command.execute(world);
         self.undo_stack.push(command);
         self.pushes += 1;
+        self.revision = next_revision();
         self.redo_stack.clear();
         self.trim_to_budget();
+    }
+
+    /// Which state of the document this history last left. It rises on every
+    /// do, undo and redo and on [`clear`](Self::clear), and never repeats.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Forget both stacks, as opening another scene does.
+    pub fn clear(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.revision = next_revision();
     }
 
     /// Start collecting entries for one undo entry. Spans nest: an inner
@@ -127,16 +152,13 @@ impl CommandHistory {
 
     /// Collapse everything pushed since `span` into one entry labelled
     /// `label`, and count the span as that one entry for any enclosing
-    /// span.
-    pub fn end_span(&mut self, span: HistorySpan, label: impl Into<String>) {
-        let produced = self.pushes.saturating_sub(span.0) as usize;
-        let take = produced.min(self.undo_stack.len());
-        let at = self.undo_stack.len() - take;
-        let mut pushed = self.undo_stack.split_off(at);
+    /// span. Returns whether the span left an entry.
+    pub fn end_span(&mut self, span: HistorySpan, label: impl Into<String>) -> bool {
+        let mut pushed = self.split_span(span);
         match pushed.len() {
             0 => {
                 self.pushes = span.0;
-                return;
+                return false;
             }
             // One entry is already one entry; wrapping it would only bury
             // the description the user reads in the undo menu.
@@ -147,6 +169,23 @@ impl CommandHistory {
             })),
         }
         self.pushes = span.0 + 1;
+        true
+    }
+
+    /// Take everything pushed since `span` off the stack without undoing it,
+    /// for a caller that records the span its own way or has already put the
+    /// scene back.
+    pub fn take_span(&mut self, span: HistorySpan) -> Vec<Box<dyn EditorCommand>> {
+        let pushed = self.split_span(span);
+        self.pushes = span.0;
+        pushed
+    }
+
+    fn split_span(&mut self, span: HistorySpan) -> Vec<Box<dyn EditorCommand>> {
+        let produced = self.pushes.saturating_sub(span.0) as usize;
+        let take = produced.min(self.undo_stack.len());
+        let at = self.undo_stack.len() - take;
+        self.undo_stack.split_off(at)
     }
 
     /// Bytes both stacks currently hold.
@@ -181,6 +220,7 @@ impl CommandHistory {
         if let Some(mut command) = self.undo_stack.pop() {
             command.undo(world);
             self.redo_stack.push(command);
+            self.revision = next_revision();
         }
         dropped
     }
@@ -192,6 +232,7 @@ impl CommandHistory {
         if let Some(mut command) = self.redo_stack.pop() {
             command.execute(world);
             self.undo_stack.push(command);
+            self.revision = next_revision();
         }
         dropped
     }
@@ -199,6 +240,7 @@ impl CommandHistory {
     pub fn push_executed(&mut self, command: Box<dyn EditorCommand>) {
         self.undo_stack.push(command);
         self.pushes += 1;
+        self.revision = next_revision();
         self.redo_stack.clear();
         self.trim_to_budget();
     }
@@ -443,5 +485,35 @@ mod tests {
 
         assert_eq!(history.undo_stack.len(), 2);
         assert_eq!(history.undo_stack[0].description(), "weighty");
+    }
+
+    #[test]
+    fn the_revision_rises_on_do_undo_and_redo_and_never_repeats() {
+        let mut world = World::new();
+        let mut history = CommandHistory::default();
+        let mut seen = vec![history.revision()];
+        history.push_executed(Box::new(Weighty(1)));
+        seen.push(history.revision());
+        history.execute(Box::new(Weighty(1)), &mut world);
+        seen.push(history.revision());
+        history.undo(&mut world);
+        seen.push(history.revision());
+        history.redo(&mut world);
+        seen.push(history.revision());
+        history.clear();
+        seen.push(history.revision());
+        assert!(
+            seen.windows(2).all(|pair| pair[0] < pair[1]),
+            "every change raises the revision: {seen:?}"
+        );
+
+        let still = history.revision();
+        history.undo(&mut world);
+        history.redo(&mut world);
+        assert_eq!(history.revision(), still, "nothing to undo changes nothing");
+        assert!(
+            CommandHistory::default().revision() > still,
+            "a fresh history never reuses another's revision"
+        );
     }
 }

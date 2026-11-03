@@ -6,12 +6,21 @@ use bevy::ui::ui_transform::UiGlobalTransform;
 use jackdaw_api::prelude::*;
 use jackdaw_api_internal::keymap::PresetInput;
 use jackdaw_api_internal::lifecycle::ActiveModalOperator;
+use jackdaw_commands::EditorCommand;
 use jackdaw_geometry::halfedge::ops::loop_cut::loop_cut;
-use jackdaw_geometry::halfedge::{EdgeKey, HalfedgeMesh, VertKey};
+use jackdaw_geometry::halfedge::{
+    EdgeKey, HalfedgeBinding, HalfedgeMesh, VertKey, apply_topology_edit, edge_between,
+};
 use jackdaw_scene_types::Brush;
+use jackdaw_select::address::ElementKind;
 
 use super::modal_edit::ModalTopologyEdit;
-use crate::brush::{BrushEditMode, BrushHalfedge, BrushSelection, EditMode};
+use super::param_edit;
+use super::select_elements::{
+    edit_target, element_mode_blocked, enter_element_mode, refuse, resolve_on, selector_from_params,
+};
+use crate::brush::{BrushEditMode, BrushHalfedge, BrushSelection, EditMode, SetBrush};
+use crate::commands::CommandHistory;
 use crate::core_extension::CoreExtensionInputContext;
 use crate::snapping::SnapSettings;
 use crate::viewport::{MainViewportCamera, SceneViewport};
@@ -25,7 +34,8 @@ pub struct LoopCutPreviewLines {
 }
 
 pub(crate) fn add_to_extension(ctx: &mut ExtensionContext) {
-    ctx.register_operator::<BrushLoopCutOp>();
+    ctx.register_operator::<BrushLoopCutOp>()
+        .register_operator::<BrushLoopCutAtOp>();
 
     ctx.bind_operator::<CoreExtensionInputContext, BrushLoopCutOp>([
         PresetInput::key("KeyR").ctrl_or_super()
@@ -64,7 +74,7 @@ pub struct LoopCutModalState {
     label = "Loop Cut",
     is_available = can_run_loop_cut,
     modal = true,
-    allows_undo = false,
+    allows_undo = true,
     cancel = cancel_loop_cut,
 )]
 pub(crate) fn brush_loop_cut(
@@ -109,7 +119,7 @@ pub(crate) fn brush_loop_cut(
         // Resolve cache pair -> EdgeKey.
         let va: VertKey = *halfedge.vert_keys.get(a)?;
         let vb: VertKey = *halfedge.vert_keys.get(b)?;
-        let edge_key = find_edge_between(&halfedge.mesh, va, vb)?;
+        let edge_key = edge_between(&halfedge.mesh, va, vb)?;
 
         // Project the start edge's canonical endpoints to window space so each
         // subsequent frame can compute t directly from cursor position.
@@ -206,57 +216,13 @@ pub(crate) fn brush_loop_cut(
         };
         let brush = brush_mut.into_inner();
 
-        // Source new split faces from the brush's last face (matching the prior
-        // grow-loop template), keeping its UV axes; the seam then recomputes
-        // every plane.
-        let source = edit
-            .snapshot_brush()
-            .faces
-            .last()
-            .cloned()
-            .unwrap_or_default();
-        let original_face_count = edit.snapshot_brush().faces.len();
-
-        // Restore to the snapshot, run the cut at the chosen t, and reconcile.
-        // The closure resolves each new loop-ring edge's topology vertex pair
-        // before flatten, while slotmap iteration order still matches what the
-        // flatten will use (loop_cut never removes verts, so the indices hold).
-        // Returns `None` if the cut fails so the commit can cancel.
-        let new_loop_edge_pairs = edit.apply(brush, &mut halfedge, |mesh| {
-            let Ok(loop_cut_result) = loop_cut(mesh, edge_key, t) else {
-                return None;
-            };
-            let mut vk_to_topo: std::collections::HashMap<VertKey, usize> =
-                std::collections::HashMap::with_capacity(mesh.verts.len());
-            for (i, (k, _)) in mesh.verts.iter().enumerate() {
-                vk_to_topo.insert(k, i);
-            }
-            let mut pairs: Vec<(usize, usize)> =
-                Vec::with_capacity(loop_cut_result.new_loop_edges.len());
-            for ek in &loop_cut_result.new_loop_edges {
-                let edge = &mesh.edges[*ek];
-                let Some(&a) = vk_to_topo.get(&edge.v[0]) else {
-                    continue;
-                };
-                let Some(&b) = vk_to_topo.get(&edge.v[1]) else {
-                    continue;
-                };
-                let pair = if a < b { (a, b) } else { (b, a) };
-                pairs.push(pair);
-            }
-            Some(pairs)
-        });
+        edit.restore(brush, &mut halfedge);
+        let new_loop_edge_pairs = cut_loops(brush, &mut halfedge.0, edge_key, &[t]);
 
         let Some(new_loop_edge_pairs) = new_loop_edge_pairs else {
             clear_modal(&mut modal_state, &mut preview_lines);
             return None;
         };
-
-        // Each new split face inherits the source face's appearance.
-        for new_face in original_face_count..brush.faces.len() {
-            brush.faces[new_face].copy_appearance_from(&source);
-            brush.faces[new_face].ensure_uv_axes();
-        }
 
         // Chain selection: write the newly created loop ring edges into
         // `BrushSelection.edges` so a follow-up gesture (loop cut again,
@@ -275,6 +241,225 @@ pub(crate) fn brush_loop_cut(
     }
 
     Some(OperatorResult::Running)
+}
+
+/// Cut new edge loops across the strip of quads through one edge, as one undo
+/// entry. The parametric form of the loop cut drag: the edge is named by index
+/// or picked by rules, one cut lands at `factor` along it and several are
+/// spaced evenly, and the cut is checked before the edit mode or the selection
+/// change. Leaves the new loops selected in Edge mode.
+#[operator(
+    id = "brush.mesh.loop_cut_at",
+    label = "Loop Cut at Edge",
+    description = "Cut new edge loops across the strip of quads through an edge, at its middle \
+                   or where `factor` puts them.",
+    allows_undo = false,
+    params(
+        entity(
+            Entity,
+            doc = "Brush to cut. Defaults to the brush being edited, else the selected one."
+        ),
+        edge(
+            i64,
+            doc = "Edge to cut across, an index into the `jackdaw/brush_topology` edge list."
+        ),
+        r#where(
+            String,
+            doc = "Rules picking the edge to cut across, as `brush.select_elements` takes \
+                   them; the lowest-numbered match is cut. With `edge`, both must hold."
+        ),
+        count(
+            i64,
+            doc = "How many loops to cut, evenly spaced along the edge, 1 to 32. Defaults to 1."
+        ),
+        factor(
+            f64,
+            doc = "Where a single loop crosses the edge, as a fraction from its first vertex \
+                   in the `jackdaw/brush_topology` edge list, between 0 and 1. Defaults to 0.5."
+        ),
+    )
+)]
+pub(crate) fn brush_loop_cut_at(
+    params: In<OperatorParameters>,
+    world: &mut World,
+) -> OperatorResult {
+    let spacing = match LoopSpacing::read(&params) {
+        Ok(spacing) => spacing,
+        Err(why) => return refuse(world, "Loop Cut at Edge", why),
+    };
+    let (entity, edge) = match loop_cut_target(world, &params) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            warn_caller(world, "Loop Cut at Edge: no edge matches `where`");
+            set_outcome(world, Outcome::Unchanged);
+            return OperatorResult::Cancelled;
+        }
+        Err(why) => return refuse(world, "Loop Cut at Edge", why),
+    };
+    if let Some(why) = element_mode_blocked(world) {
+        return refuse(world, "Loop Cut at Edge", why);
+    }
+    let Some(old) = world.get::<Brush>(entity).cloned() else {
+        return refuse(
+            world,
+            "Loop Cut at Edge",
+            format!("`entity` {entity} is not a brush"),
+        );
+    };
+    let Some((brush, new_loop)) = cut_across(&old, edge, spacing) else {
+        warn_caller(
+            world,
+            format!("Loop Cut at Edge: edge {edge} has no strip of quads to cut across"),
+        );
+        set_outcome(world, Outcome::Unchanged);
+        return OperatorResult::Cancelled;
+    };
+
+    enter_element_mode(world, entity, ElementKind::Edge);
+    let report = param_edit::Counts::of(&old.topology).added(&brush.topology);
+    let vert_count = brush.topology.vertices.len();
+    let mut command: Box<dyn EditorCommand> = Box::new(SetBrush {
+        entity,
+        old,
+        new: brush,
+        label: "Loop Cut".to_string(),
+    });
+    command.execute(world);
+    world
+        .resource_mut::<CommandHistory>()
+        .push_executed(command);
+    report_to_caller(world, format!("Loop Cut at Edge: {report}"));
+
+    let new_loop: Vec<(usize, usize)> = new_loop
+        .into_iter()
+        .filter(|(a, b)| *a < vert_count && *b < vert_count)
+        .collect();
+    world.resource_mut::<BrushSelection>().sub_mut(entity).edges = new_loop;
+    set_outcome(world, Outcome::Changed);
+    OperatorResult::Finished
+}
+
+/// The brush and edge a parametric loop cut acts on; `None` when the rules
+/// match no edge.
+fn loop_cut_target(
+    world: &World,
+    params: &OperatorParameters,
+) -> Result<Option<(Entity, usize)>, String> {
+    let mut selector = selector_from_params(params)?;
+    if params.contains_key("edge") {
+        let edge = params
+            .as_int("edge")
+            .and_then(|edge| usize::try_from(edge).ok())
+            .ok_or("`edge` must be an edge index")?;
+        selector.indices = Some(vec![edge]);
+    }
+    if selector.is_empty() {
+        return Err("give `edge` or `where` to name the edge to cut across".into());
+    }
+    let entity = edit_target(world, params.get("entity"))?;
+    let edges = resolve_on(world, entity, ElementKind::Edge, &selector)?;
+    Ok(edges.first().map(|edge| (entity, *edge)))
+}
+
+/// The most loops one parametric loop cut makes.
+const MAX_LOOP_CUTS: u32 = 32;
+
+/// Where a parametric loop cut crosses its edge.
+#[derive(Clone, Copy)]
+enum LoopSpacing {
+    /// One loop, this fraction along the edge from its first topology vertex.
+    At(f32),
+    /// This many loops, evenly spaced.
+    Even(u32),
+}
+
+impl LoopSpacing {
+    fn read(params: &OperatorParameters) -> Result<Self, String> {
+        let count = param_edit::count(params, "count", MAX_LOOP_CUTS)?.unwrap_or(1);
+        let factor = param_edit::number(params, "factor")?;
+        match factor {
+            Some(_) if count > 1 => Err("give `factor` only for a single loop".into()),
+            Some(factor) if factor <= 0.0 || factor >= 1.0 => {
+                Err(format!("`factor` {factor} must be between 0 and 1"))
+            }
+            Some(factor) => Ok(Self::At(factor)),
+            None if count == 1 => Ok(Self::At(0.5)),
+            None => Ok(Self::Even(count)),
+        }
+    }
+}
+
+/// `brush` with loops cut across `edge` as `spacing` places them, and the new
+/// loops' vertex pairs, worked on a binding lifted fresh from its topology.
+/// `None` when the edge runs through no strip of quads.
+fn cut_across(
+    brush: &Brush,
+    edge: usize,
+    spacing: LoopSpacing,
+) -> Option<(Brush, Vec<(usize, usize)>)> {
+    let [a, b] = brush.topology.edges.get(edge)?.v;
+    let mut binding = HalfedgeBinding::lift_from_topology(&brush.topology);
+    let va = *binding.vert_keys.get(a as usize)?;
+    let vb = *binding.vert_keys.get(b as usize)?;
+    let edge_key = edge_between(&binding.mesh, va, vb)?;
+    // Each cut keeps `edge_key` on the part from its first vertex, so even
+    // loops are cut from the far end inwards.
+    let cuts: Vec<f32> = match spacing {
+        LoopSpacing::At(factor) if binding.mesh.edges[edge_key].v[0] == va => vec![factor],
+        LoopSpacing::At(factor) => vec![1.0 - factor],
+        LoopSpacing::Even(count) => (1..=count)
+            .rev()
+            .map(|k| k as f32 / (k + 1) as f32)
+            .collect(),
+    };
+    let mut cut = brush.clone();
+    let new_loop = cut_loops(&mut cut, &mut binding, edge_key, &cuts)?;
+    Some((cut, new_loop))
+}
+
+/// Cut a loop through `edge` at each fraction in `cuts`, in order, and
+/// reconcile the brush. The new loops' vertex pairs, or `None` when a cut
+/// fails, leaving the brush to be discarded.
+fn cut_loops(
+    brush: &mut Brush,
+    binding: &mut HalfedgeBinding,
+    edge: EdgeKey,
+    cuts: &[f32],
+) -> Option<Vec<(usize, usize)>> {
+    apply_topology_edit(&mut brush.faces, &mut brush.topology, binding, |mesh| {
+        let mut new_edges = Vec::new();
+        for &t in cuts {
+            new_edges.extend(loop_cut(mesh, edge, t).ok()?.new_loop_edges);
+        }
+        Some(topology_pairs(mesh, &new_edges))
+    })
+}
+
+/// The topology vertex pairs of `edges` in `mesh` as it will flatten, each
+/// once, skipping any edge or vertex no longer in the mesh. Valid for edits
+/// that never remove vertices, since slot order is then the flattened vertex
+/// order.
+pub(super) fn topology_pairs(mesh: &HalfedgeMesh, edges: &[EdgeKey]) -> Vec<(usize, usize)> {
+    let vk_to_topo: std::collections::HashMap<VertKey, usize> = mesh
+        .verts
+        .iter()
+        .enumerate()
+        .map(|(i, (k, _))| (k, i))
+        .collect();
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(edges.len());
+    for ek in edges {
+        let Some(edge) = mesh.edges.get(*ek) else {
+            continue;
+        };
+        let (Some(&a), Some(&b)) = (vk_to_topo.get(&edge.v[0]), vk_to_topo.get(&edge.v[1])) else {
+            continue;
+        };
+        let pair = if a < b { (a, b) } else { (b, a) };
+        if !pairs.contains(&pair) {
+            pairs.push(pair);
+        }
+    }
+    pairs
 }
 
 /// Cancel handler: restore the brush to its pre-modal state and clear the preview.
@@ -371,13 +556,6 @@ fn edge_endpoints_window(
     } else {
         (v0_rt, v1_rt)
     }
-}
-
-fn find_edge_between(mesh: &HalfedgeMesh, va: VertKey, vb: VertKey) -> Option<EdgeKey> {
-    mesh.edges
-        .iter()
-        .find(|(_, e)| (e.v[0] == va && e.v[1] == vb) || (e.v[0] == vb && e.v[1] == va))
-        .map(|(k, _)| k)
 }
 
 /// Snap `t` to the nearest of {0, 1/4, 1/3, 1/2, 2/3, 3/4, 1}.

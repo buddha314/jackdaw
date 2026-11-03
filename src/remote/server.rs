@@ -10,15 +10,17 @@ use std::path::{Path, PathBuf};
 
 use bevy::asset::UntypedAssetId;
 use bevy::diagnostic::FrameCount;
+use bevy::ecs::entity::EntityHashSet;
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy::remote::{BrpError, BrpResult, RemotePlugin, error_codes, http::RemoteHttpPlugin};
 use bevy::tasks::{IoTaskPool, Task, futures_lite::future};
 use jackdaw_api_internal::lifecycle::{ActiveModalOperator, OperatorEntity};
 use jackdaw_api_internal::operator::{
-    CallOperatorError, CallOperatorSettings, ExecutionContext, OperatorParameters, OperatorReports,
-    OperatorResult, OperatorWarnings, OperatorWorldExt, ParamSpec, with_batch_snapshot,
-    with_history_span,
+    BooleanReport, CallOperatorError, CallOperatorSettings, ExecutionContext,
+    OperatorBooleanReport, OperatorOutcome, OperatorParameters, OperatorReplacements,
+    OperatorReports, OperatorResult, OperatorWarnings, OperatorWorldExt, ParamSpec,
+    with_batch_transaction, with_history_span,
 };
 use jackdaw_commands::{CommandHistory, EditorCommand};
 use jackdaw_env::editor_endpoint::{
@@ -34,6 +36,10 @@ use crate::project::ProjectRoot;
 use crate::scenes::Scenes;
 use crate::screenshot::CaptureError;
 use crate::selection::Selection;
+
+pub use super::paced::paced_batch_handler;
+pub use super::summary::{check_handler, scene_summary_handler};
+pub use super::topology::brush_topology_handler;
 
 /// The editor's BRP port. One past the game's 15702, so an editor and the
 /// game it is running never contend for the same socket.
@@ -99,7 +105,7 @@ pub fn track_remote_enabled(world: &mut World) {
 
 /// The refusal every method gives while the open project has turned the
 /// surface off.
-fn check_enabled(world: &World) -> Result<(), BrpError> {
+pub(super) fn check_enabled(world: &World) -> Result<(), BrpError> {
     if world.get_resource::<RemoteEnabled>().is_none_or(|e| e.0) {
         return Ok(());
     }
@@ -149,13 +155,18 @@ impl Plugin for JackdawEditorRemotePlugin {
                     .with_method_main("jackdaw/operators", operators_handler)
                     .with_method_main("jackdaw/call_operator", call_operator_handler)
                     .with_method_main("jackdaw/batch", batch_handler)
+                    .with_watching_method_main("jackdaw/paced_batch", paced_batch_handler)
                     .with_method_main("jackdaw/cancel", cancel_handler)
                     .with_method_main("jackdaw/scene_tree", scene_tree_handler)
+                    .with_method_main("jackdaw/scene_summary", scene_summary_handler)
+                    .with_method_main("jackdaw/check", check_handler)
+                    .with_method_main("jackdaw/brush_topology", brush_topology_handler)
                     .with_method_main("jackdaw/entity", entity_handler)
                     .with_method_main("jackdaw/apply_bsn", apply_bsn_handler)
                     .with_method_main("jackdaw/scene_bsn", scene_bsn_handler)
                     .with_watching_method_main("jackdaw/assets", assets_handler)
                     .with_watching_method_main("jackdaw/screenshot", screenshot_handler)
+                    .with_watching_method_main("jackdaw/views", views_handler)
                     .with_watching_method_main("jackdaw/wait", wait_handler),
             )
             // No CORS headers: allowing an origin would hand any page served on
@@ -166,6 +177,7 @@ impl Plugin for JackdawEditorRemotePlugin {
                     .with_port(self.port),
             )
             .add_systems(Update, (track_remote_enabled, publish_endpoint).chain())
+            .add_systems(Update, super::paced::drive_paced_batch)
             .add_systems(Last, retract_endpoint);
     }
 }
@@ -258,7 +270,7 @@ fn active_scene_path(world: &World) -> Option<&Path> {
 
 // --- Shared helpers ---
 
-fn invalid_params(message: impl Into<String>) -> BrpError {
+pub(super) fn invalid_params(message: impl Into<String>) -> BrpError {
     BrpError {
         code: error_codes::INVALID_PARAMS,
         message: message.into(),
@@ -412,25 +424,24 @@ fn property_to_json(value: &PropertyValue) -> Value {
     }
 }
 
-/// The entity a `{"entity": <id>}` or `{"name": "<Name>"}` field means.
-fn entity_from_params(world: &mut World, params: &Value) -> Result<Entity, BrpError> {
+/// The entity a `{"entity": <id>}` or `{"name": "<reference>"}` field means;
+/// the reference is an id, a name path or a query matching one node.
+pub(super) fn entity_from_params(world: &mut World, params: &Value) -> Result<Entity, BrpError> {
     if let Some(bits) = params.get("entity").and_then(Value::as_u64) {
         return Entity::try_from_bits(bits)
             .filter(|entity| world.get_entity(*entity).is_ok())
             .ok_or_else(|| invalid_params(format!("no entity with id {bits}")));
     }
-    let Some(name) = params.get("name").and_then(Value::as_str) else {
+    let Some(name) = params
+        .get("name")
+        .or_else(|| params.get("entity"))
+        .and_then(Value::as_str)
+    else {
         return Err(invalid_params(
             "expected an \"entity\" id or a \"name\"".to_string(),
         ));
     };
-    let mut named = world.query_filtered::<(Entity, &Name), Without<crate::EditorEntity>>();
-    let mut instances = world.query_filtered::<
-        (Entity, &crate::prefab::IsA),
-        (Without<Name>, Without<crate::EditorEntity>),
-    >();
-    crate::boot_ops::unique_labelled_entity(named.iter(world), instances.iter(world), name)
-        .ok_or_else(|| invalid_params(format!("`{name}` names no entity in this scene, or two")))
+    crate::entity_refs::resolve_one(world, name).map_err(invalid_params)
 }
 
 // --- Methods ---
@@ -481,6 +492,9 @@ pub fn status_handler(In(_): In<Option<Value>>, world: &mut World) -> BrpResult 
         "scene": scene,
         "dirty": dirty,
         "selection": selection,
+        // The project palette: the active one, every palette's names and the
+        // material files they stand for, and why the file could not be read.
+        "palette": crate::material_palette::palette_status(world),
         // Non-null means a modal operator is holding the editor and every
         // other modal call will be refused until `jackdaw/cancel`.
         "modal": modal,
@@ -535,7 +549,8 @@ fn pending_dialog(world: &mut World) -> Option<Value> {
     }))
 }
 
-/// Every operator a caller may call, with its parameter schema.
+/// Every operator a caller may call, with its parameter schema. `prefix`
+/// narrows the list, and `id` answers for that one operator.
 pub fn operators_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
     check_enabled(world)?;
     let prefix = params
@@ -544,6 +559,11 @@ pub fn operators_handler(In(params): In<Option<Value>>, world: &mut World) -> Br
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let exact = params
+        .as_ref()
+        .and_then(|params| params.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     let listed = world
         .run_system_cached(offered_operators)
@@ -552,18 +572,18 @@ pub fn operators_handler(In(params): In<Option<Value>>, world: &mut World) -> Br
     let operators: Vec<Value> = listed
         .into_iter()
         .filter(|op| op.id().starts_with(&prefix))
+        .filter(|op| exact.as_deref().is_none_or(|id| op.id() == id))
         .map(|op| {
             let available = world.operator(op.id()).is_available().unwrap_or(false);
             let params: Vec<Value> = op
                 .parameters()
                 .iter()
                 .map(|spec| {
-                    json!({
-                        "name": spec.name,
-                        "type": spec.ty,
-                        "default": spec.default.as_ref().map(property_to_json),
-                        "doc": spec.doc,
-                    })
+                    let mut param = json!({ "name": spec.name, "type": spec.ty, "doc": spec.doc });
+                    if let Some(default) = &spec.default {
+                        param["default"] = property_to_json(default);
+                    }
+                    param
                 })
                 .collect();
             json!({
@@ -584,6 +604,7 @@ pub fn operators_handler(In(params): In<Option<Value>>, world: &mut World) -> Br
 /// One operator call, typed from JSON and dispatched on the main world.
 pub fn call_operator_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
     check_enabled(world)?;
+    super::paced::refuse_while_playing(world, "jackdaw/call_operator")?;
     let params = params.ok_or_else(|| invalid_params("expected {\"id\": \"<operator id>\"}"))?;
     let history = params
         .get("history")
@@ -591,86 +612,667 @@ pub fn call_operator_handler(In(params): In<Option<Value>>, world: &mut World) -
         .unwrap_or(true);
     let call = call_from_json(world, &params)?;
     let outcome = dispatch(world, call, history)?;
-    Ok(json!(outcome))
+    Ok(outcome.to_json(verbose(&params)))
+}
+
+/// Whether the caller asked for the whole outcome rather than the compact one.
+fn verbose(params: &Value) -> bool {
+    params
+        .get("verbose")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Run a batch of calls as one undo entry. A call that stops the batch leaves
 /// the earlier ones done, and the error says so.
+///
+/// A string parameter spelled `$N.path` takes the value at `path` in call
+/// `N`'s outcome, e.g. `$0.entities.0` for the first entity call 0 added. A
+/// malformed reference, or one to a call that does not run earlier, refuses
+/// the whole batch before anything runs.
+///
+/// `atomic` takes the whole batch back when a call fails, does not finish or a
+/// check fails: the scene and the history are left as they were. `dry_run`
+/// runs the calls and checks, reports them, and takes everything back.
+/// `stage` builds the calls' new nodes into the group of that name, deleting
+/// what an earlier run built there, and refuses a call that changes anything
+/// outside it; `after` names stages that must already exist. A staged batch
+/// is atomic. `checks` are `jackdaw/check` assertions evaluated after the
+/// calls; one that fails fails the batch. Atomic, dry-run and staged batches
+/// refuse calls a rollback cannot take back, such as saving a file. A batch
+/// played with a pause between calls goes to `jackdaw/paced_batch`.
 pub fn batch_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
     check_enabled(world)?;
+    super::paced::refuse_while_playing(world, "jackdaw/batch")?;
     let params = params.ok_or_else(|| invalid_params("expected {\"calls\": [...]}"))?;
-    let Some(calls) = params.get("calls").and_then(Value::as_array) else {
-        return Err(invalid_params("expected {\"calls\": [...]}"));
-    };
-    let label = params
-        .get("label")
-        .and_then(Value::as_str)
-        .unwrap_or("Batch")
-        .to_string();
-
-    let mut prepared = Vec::with_capacity(calls.len());
-    for (index, call) in calls.iter().enumerate() {
-        prepared.push(
-            call_from_json(world, call)
-                .map_err(|err| invalid_params(format!("call {index}: {}", err.message)))?,
-        );
+    if params.get("pace_ms").is_some_and(|pace| !pace.is_null()) {
+        return Err(invalid_params(
+            "`pace_ms` plays a batch over frames: send it to `jackdaw/paced_batch` with a \
+             `request` id",
+        ));
     }
-
-    let results = with_batch_snapshot(world, label, move |world| {
-        let mut results = Vec::with_capacity(prepared.len());
-        for (index, call) in prepared.into_iter().enumerate() {
-            match dispatch(world, call, false) {
-                Ok(outcome) => {
-                    let stop = outcome.result != "finished";
-                    let entered_modal = outcome.result == "running";
-                    results.push((index, Ok(outcome)));
-                    if entered_modal {
-                        // A modal operator waits for a pointer that is never
-                        // coming, and holds off every later modal call.
-                        if let Err(err) = world.cancel_active_modal() {
-                            warn!("jackdaw/batch: could not cancel the modal call: {err}");
-                        }
-                    }
-                    if stop {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    results.push((index, Err(err)));
-                    break;
-                }
-            }
+    let (plan, prepared) = BatchPlan::from_params(world, &params)?;
+    let run = with_batch_transaction(world, plan.label.clone(), plan.atomic, |world| {
+        let mut runner = BatchRunner::start(world, prepared, plan.stage.as_ref());
+        while !runner.is_done() {
+            runner.step(world);
         }
-        results
+        let run = runner.finish(world, &plan.checks);
+        let keep = plan.keeps(&run);
+        (run, keep)
     });
+    plan.answer(run)
+}
 
-    let mut done = Vec::new();
-    for (index, result) in results {
-        match result {
-            Ok(outcome) => done.push(json!(outcome)),
-            Err(err) => {
-                return Err(BrpError {
-                    code: err.code,
-                    message: format!(
-                        "call {index} ({}) failed: {}. The {} call(s) before it are done and are \
-                         committed as one undo entry; undo once to take them back rather than \
-                         retrying the whole batch.",
-                        done.len(),
-                        err.message,
-                        done.len()
-                    ),
-                    data: Some(json!({ "failed_at": index, "calls": done })),
-                });
+/// A batch's parameters, checked, and what it needs to answer once it has run.
+pub(super) struct BatchPlan {
+    calls: Vec<Value>,
+    pub(super) label: String,
+    verbose: bool,
+    dry_run: bool,
+    pub(super) atomic: bool,
+    pub(super) stage: Option<super::stage::StageSpec>,
+    pub(super) checks: Vec<Value>,
+}
+
+impl BatchPlan {
+    /// Check a batch's parameters and type every call that can be typed before
+    /// anything runs.
+    pub(super) fn from_params(
+        world: &mut World,
+        params: &Value,
+    ) -> Result<(Self, Vec<Pending>), BrpError> {
+        let Some(calls) = params.get("calls").and_then(Value::as_array) else {
+            return Err(invalid_params("expected {\"calls\": [...]}"));
+        };
+        let label = params
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or("Batch")
+            .to_string();
+        let dry_run = flag(params, "dry_run")?;
+        let stage = super::stage::StageSpec::from_params(params)?;
+        let atomic = flag(params, "atomic")? || dry_run || stage.is_some();
+        let checks = match params.get("checks") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(checks)) => checks.clone(),
+            Some(_) => return Err(invalid_params("`checks` is a list of assertions")),
+        };
+        for (index, check) in checks.iter().enumerate() {
+            let refused = |err: BrpError| invalid_params(format!("check {index}: {}", err.message));
+            super::summary::check_shape(check).map_err(refused)?;
+            check_references(Some(check), calls.len()).map_err(refused)?;
+        }
+        if atomic {
+            refuse_unrecoverable(world, calls)?;
+        }
+        if let Some(stage) = &stage {
+            stage.check(world)?;
+        }
+
+        let mut prepared = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            let refused = |err: BrpError| invalid_params(format!("call {index}: {}", err.message));
+            let referenced = check_references(call.get("params"), index).map_err(refused)?;
+            if referenced {
+                // Everything but the referencing parameters is typed now, so a
+                // mistake there refuses the batch before anything runs.
+                let mut known = call.clone();
+                if let Some(params) = known.get_mut("params").and_then(Value::as_object_mut) {
+                    params.retain(|_, value| !holds_reference(value));
+                }
+                typed_call(world, &fill_references(&known, &[]).map_err(refused)?)
+                    .map_err(refused)?;
+                prepared.push(Pending::Referencing(call.clone()));
+            } else {
+                // Typed now so a mistake refuses the batch, but its entity
+                // references resolve when it runs, against what earlier calls left.
+                let call = fill_references(call, &[]).map_err(refused)?;
+                typed_call(world, &call).map_err(refused)?;
+                prepared.push(Pending::Ready(call));
             }
         }
+        let plan = Self {
+            calls: calls.clone(),
+            label,
+            verbose: verbose(params),
+            dry_run,
+            atomic,
+            stage,
+            checks,
+        };
+        Ok((plan, prepared))
     }
-    Ok(json!({ "calls": done }))
+
+    /// Whether what `run` did stays.
+    pub(super) fn keeps(&self, run: &BatchRun) -> bool {
+        match run.failure {
+            Some(_) => !self.atomic,
+            None => !self.dry_run,
+        }
+    }
+
+    /// The answer, or the error, for a batch that ran as `run`.
+    pub(super) fn answer(&self, run: BatchRun) -> BrpResult {
+        let (dry_run, atomic, verbose) = (self.dry_run, self.atomic, self.verbose);
+        let checks = &self.checks;
+        let done: Vec<Value> = run.done.iter().map(|call| call.to_json(verbose)).collect();
+        let checks_skipped = !checks.is_empty()
+            && matches!(
+                run.failure,
+                Some(BatchFailure::Call(..) | BatchFailure::Stopped(_) | BatchFailure::Stage(_))
+            );
+        let Some(failure) = self.failure(&run) else {
+            return Ok(batch_answer(done, dry_run, run.stage, run.checks));
+        };
+        let mut what = failure.what;
+        if checks_skipped {
+            what.push_str(", so the checks were not run");
+        }
+        let message = if atomic {
+            format!(
+                "{what}. The batch was rolled back: the scene and the undo history are as they were."
+            )
+        } else {
+            format!(
+                "{what}. The {} call(s) that ran are done and are committed as one undo entry; undo \
+                 once to take them back rather than retrying the whole batch.",
+                done.len()
+            )
+        };
+        let mut data =
+            json!({ "failed_at": failure.failed_at, "calls": done, "rolled_back": atomic });
+        if dry_run {
+            data["dry_run"] = json!(true);
+        }
+        if let Some(checks) = run.checks {
+            data["checks"] = checks;
+        }
+        Err(BrpError {
+            code: failure.code,
+            message,
+            data: Some(data),
+        })
+    }
+
+    /// What stopped `run`, or `None` for a run that did all it was asked, or
+    /// a plain batch whose call merely did not finish.
+    pub(super) fn failure(&self, run: &BatchRun) -> Option<BatchFailureText> {
+        let calls = &self.calls;
+        let call_id = |index: usize| calls[index]["id"].as_str().unwrap_or("?");
+        let (code, what, failed_at) = match run.failure.as_ref()? {
+            BatchFailure::Stopped(_) if !self.atomic && self.checks.is_empty() => return None,
+            BatchFailure::Call(index, err) => (
+                err.code,
+                format!("call {index} ({}) failed: {}", call_id(*index), err.message),
+                json!(*index),
+            ),
+            BatchFailure::Stopped(index) => {
+                let outcome = run.done[*index].to_json(true);
+                let mut what = format!(
+                    "call {index} ({}) did not finish: {}",
+                    call_id(*index),
+                    outcome["result"].as_str().unwrap_or("?")
+                );
+                if let Some(warnings) = outcome["warnings"].as_array()
+                    && !warnings.is_empty()
+                {
+                    let warnings: Vec<&str> = warnings.iter().filter_map(Value::as_str).collect();
+                    what.push_str(&format!(" ({})", warnings.join("; ")));
+                }
+                (error_codes::INVALID_PARAMS, what, json!(*index))
+            }
+            BatchFailure::Stage(why) => (
+                error_codes::INTERNAL_ERROR,
+                format!("the stage could not be opened: {why}"),
+                Value::Null,
+            ),
+            BatchFailure::Checks => {
+                let results = run
+                    .checks
+                    .as_ref()
+                    .and_then(|checks| checks["results"].as_array());
+                let failed: Vec<String> = results
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .filter(|(_, result)| result["pass"] != json!(true))
+                    .map(|(index, result)| {
+                        format!("{index} ({})", result["check"].as_str().unwrap_or("?"))
+                    })
+                    .collect();
+                (
+                    error_codes::INVALID_PARAMS,
+                    format!(
+                        "{} of {} checks failed: {}",
+                        failed.len(),
+                        results.map_or(0, Vec::len),
+                        failed.join(", ")
+                    ),
+                    Value::Null,
+                )
+            }
+            BatchFailure::CheckError(err) => (
+                err.code,
+                format!("the checks could not run: {}", err.message),
+                Value::Null,
+            ),
+        };
+        Some(BatchFailureText {
+            code,
+            what,
+            failed_at,
+        })
+    }
+}
+
+/// Why a batch failed, as its error says it.
+pub(super) struct BatchFailureText {
+    pub(super) code: i16,
+    /// What failed, without what became of the calls that ran.
+    pub(super) what: String,
+    pub(super) failed_at: Value,
+}
+
+/// What a batch that did all it was asked answers.
+fn batch_answer(
+    done: Vec<Value>,
+    dry_run: bool,
+    stage: Option<Value>,
+    checks: Option<Value>,
+) -> Value {
+    let mut answer = json!({ "calls": done });
+    if dry_run {
+        answer["dry_run"] = json!(true);
+    }
+    if let Some(stage) = stage {
+        answer["stage"] = stage;
+    }
+    if let Some(checks) = checks {
+        answer["checks"] = checks;
+    }
+    answer
+}
+
+/// A boolean parameter, false when absent.
+fn flag(params: &Value, key: &str) -> Result<bool, BrpError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(invalid_params(format!(
+            "`{key}` is true or false, not {other}"
+        ))),
+    }
+}
+
+/// Why a rollback could not take a call to `id` back, from the flags the
+/// operator declares; `None` when it could.
+fn beyond_rollback(In(id): In<String>, ops: Query<&OperatorEntity>) -> Option<&'static str> {
+    let op = ops.iter().find(|op| op.id() == id)?;
+    if op.writes_disk() {
+        Some("writes to disk")
+    } else if op.leaves_history() {
+        Some("leaves the history the batch records into")
+    } else {
+        None
+    }
+}
+
+/// Refuse a batch that must be able to roll back but holds a call that writes
+/// to disk or leaves the batch's history, naming every such call.
+fn refuse_unrecoverable(world: &mut World, calls: &[Value]) -> Result<(), BrpError> {
+    let mut found: Vec<(usize, String, &'static str)> = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        let Some(id) = call.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let why = world
+            .run_system_cached_with(beyond_rollback, id.to_string())
+            .map_err(|err| internal_error(err.to_string()))?;
+        if let Some(why) = why {
+            found.push((index, id.to_string(), why));
+        }
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    let listed: Vec<String> = found
+        .iter()
+        .map(|(index, id, why)| format!("call {index} ({id}) {why}"))
+        .collect();
+    Err(BrpError {
+        code: error_codes::INVALID_PARAMS,
+        message: format!(
+            "{}; a rollback cannot take that back, so an atomic, dry-run or staged batch refuses \
+             it. Run it in a plain batch or call once this one is done.",
+            listed.join("; ")
+        ),
+        data: Some(json!({
+            "unrecoverable": found
+                .iter()
+                .map(|(index, id, why)| json!({ "call": index, "id": id, "why": why }))
+                .collect::<Vec<_>>(),
+        })),
+    })
+}
+
+/// What running a batch's calls did.
+#[derive(Default)]
+pub(super) struct BatchRun {
+    /// Every call that ran, the one that stopped the batch included.
+    done: Vec<CallOutcome>,
+    failure: Option<BatchFailure>,
+    stage: Option<Value>,
+    checks: Option<Value>,
+}
+
+/// Why a batch did not do all it was asked.
+enum BatchFailure {
+    /// The call at this index failed, or a stage refused what it did.
+    Call(usize, BrpError),
+    /// The call at this index ended without finishing.
+    Stopped(usize),
+    Stage(String),
+    /// An assertion failed; the results say which.
+    Checks,
+    /// An assertion could not be evaluated.
+    CheckError(BrpError),
+}
+
+/// A batch's calls run one step at a time, so a paced batch can let frames
+/// pass between them.
+pub(super) struct BatchRunner {
+    pending: std::vec::IntoIter<Pending>,
+    index: usize,
+    earlier: Vec<Value>,
+    open: Option<super::stage::OpenStage>,
+    /// The root references are held to while a call runs, and whether the
+    /// selection is cleared before each call so none acts on what an earlier
+    /// one selected.
+    scope: Option<Entity>,
+    run: BatchRun,
+}
+
+impl BatchRunner {
+    /// Ready to run `prepared`, with the stage open if one is named.
+    pub(super) fn start(
+        world: &mut World,
+        prepared: Vec<Pending>,
+        stage: Option<&super::stage::StageSpec>,
+    ) -> Self {
+        let mut run = BatchRun::default();
+        let open = match stage.map(|spec| super::stage::OpenStage::open(world, spec)) {
+            None => None,
+            Some(Ok(open)) => Some(open),
+            Some(Err(why)) => {
+                run.failure = Some(BatchFailure::Stage(why));
+                None
+            }
+        };
+        Self {
+            earlier: Vec::with_capacity(prepared.len()),
+            pending: prepared.into_iter(),
+            index: 0,
+            open,
+            scope: None,
+            run,
+        }
+    }
+
+    /// Ready to run `prepared` into `root`, opened as a stage: every entity
+    /// reference a call makes names only nodes under it, and the selection is
+    /// cleared before each call.
+    pub(super) fn start_in(
+        prepared: Vec<Pending>,
+        open: super::stage::OpenStage,
+        root: Entity,
+    ) -> Self {
+        Self {
+            earlier: Vec::with_capacity(prepared.len()),
+            pending: prepared.into_iter(),
+            index: 0,
+            open: Some(open),
+            scope: Some(root),
+            run: BatchRun::default(),
+        }
+    }
+
+    /// Whether every call has run or one stopped the batch.
+    pub(super) fn is_done(&self) -> bool {
+        self.run.failure.is_some() || self.pending.len() == 0
+    }
+
+    /// Run the next call.
+    pub(super) fn step(&mut self, world: &mut World) {
+        if self.run.failure.is_some() {
+            return;
+        }
+        let Some(pending) = self.pending.next() else {
+            return;
+        };
+        let index = self.index;
+        self.index += 1;
+        if self.scope.is_some() {
+            crate::selection::clear_selection_in_world(world);
+        }
+        let outer_scope = world
+            .get_resource_or_init::<crate::entity_refs::ReferenceScope>()
+            .0;
+        world.resource_mut::<crate::entity_refs::ReferenceScope>().0 = self.scope.or(outer_scope);
+        let call = match pending {
+            Pending::Ready(call) => call_from_json(world, &call),
+            Pending::Referencing(call) => {
+                fill_references(&call, &self.earlier).and_then(|call| call_from_json(world, &call))
+            }
+        };
+        let dispatched = call.and_then(|call| dispatch(world, call, false));
+        world.resource_mut::<crate::entity_refs::ReferenceScope>().0 = outer_scope;
+        let outcome = match dispatched {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.run.failure = Some(BatchFailure::Call(index, err));
+                return;
+            }
+        };
+        if outcome.result == "running" {
+            // A modal operator waits for a pointer that is never coming, and
+            // holds off every later modal call.
+            if let Err(err) = world.cancel_active_modal() {
+                warn!("jackdaw/batch: could not cancel the modal call: {err}");
+            }
+        }
+        let finished = outcome.result == "finished";
+        self.earlier.push(outcome.to_json(true));
+        self.run.done.push(outcome);
+        if !finished {
+            self.run.failure = Some(BatchFailure::Stopped(index));
+            return;
+        }
+        if let Some(open) = self.open.as_mut()
+            && let Err(why) = open.after_call(world)
+        {
+            self.run.failure = Some(BatchFailure::Call(index, invalid_params(why)));
+        }
+    }
+
+    /// Report the stage and run `checks` against what the calls left.
+    pub(super) fn finish(mut self, world: &mut World, checks: &[Value]) -> BatchRun {
+        if self.run.failure.is_some() {
+            return self.run;
+        }
+        self.run.stage = self.open.as_ref().map(super::stage::OpenStage::report);
+        if checks.is_empty() {
+            return self.run;
+        }
+        let checked =
+            fill_references(&json!({ "params": checks }), &self.earlier).and_then(|filled| {
+                let assertions = filled["params"].as_array().cloned().unwrap_or_default();
+                super::summary::run_checks(world, &assertions)
+            });
+        match checked {
+            Ok(result) => {
+                if result["failed"] != json!(0) {
+                    self.run.failure = Some(BatchFailure::Checks);
+                }
+                self.run.checks = Some(result);
+            }
+            Err(err) => self.run.failure = Some(BatchFailure::CheckError(err)),
+        }
+        self.run
+    }
+}
+
+/// A batch call, checked up front, or held until the outcomes it references
+/// are in.
+pub(super) enum Pending {
+    Ready(Value),
+    Referencing(Value),
+}
+
+/// The fields of an outcome a reference can start from.
+const OUTCOME_FIELDS: [&str; 10] = [
+    "id", "result", "warnings", "entities", "reports", "outcome", "removed", "created", "bounds",
+    "report",
+];
+
+/// A `$N.path` reference: the value at `path` in call `N`'s outcome.
+#[derive(Debug, PartialEq, Eq)]
+struct ResultRef<'a> {
+    call: usize,
+    path: Vec<&'a str>,
+}
+
+/// Read `text` as a reference. `Ok(None)` is a plain string: one that does not
+/// start with `$` and a digit, or a `$$` that escapes a literal `$`.
+fn parse_reference(text: &str) -> Result<Option<ResultRef<'_>>, String> {
+    let Some(rest) = text.strip_prefix('$') else {
+        return Ok(None);
+    };
+    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let mut parts = rest.split('.');
+    let call = parts
+        .next()
+        .and_then(|index| index.parse::<usize>().ok())
+        .ok_or_else(|| {
+            format!(
+                "`{text}` is not a reference: expected `$N.field`; write `$${rest}` for text \
+                 that starts with `$`"
+            )
+        })?;
+    let path: Vec<&str> = parts.collect();
+    let Some(field) = path.first() else {
+        return Err(format!(
+            "`{text}` names a whole outcome; name a value in it, e.g. `${call}.entities.0`"
+        ));
+    };
+    if path.iter().any(|segment| segment.is_empty()) {
+        return Err(format!("`{text}` has an empty step in its path"));
+    }
+    if !OUTCOME_FIELDS.contains(field) {
+        return Err(format!(
+            "`{text}`: an outcome has no `{field}`; it has {}",
+            OUTCOME_FIELDS.join(", ")
+        ));
+    }
+    Ok(Some(ResultRef { call, path }))
+}
+
+/// Check every reference in a call's parameters against the calls that run
+/// before it. Returns whether the call has any.
+fn check_references(params: Option<&Value>, index: usize) -> Result<bool, BrpError> {
+    let mut found = false;
+    let mut pending: Vec<&Value> = params.into_iter().collect();
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::String(text) => {
+                let Some(reference) = parse_reference(text).map_err(invalid_params)? else {
+                    continue;
+                };
+                if reference.call >= index {
+                    return Err(invalid_params(format!(
+                        "`{text}` names call {}, which does not run before call {index}",
+                        reference.call
+                    )));
+                }
+                found = true;
+            }
+            Value::Array(items) => pending.extend(items),
+            Value::Object(fields) => pending.extend(fields.values()),
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
+/// Whether `value` holds a reference anywhere inside it.
+fn holds_reference(value: &Value) -> bool {
+    match value {
+        Value::String(text) => matches!(parse_reference(text), Ok(Some(_))),
+        Value::Array(items) => items.iter().any(holds_reference),
+        Value::Object(fields) => fields.values().any(holds_reference),
+        _ => false,
+    }
+}
+
+/// A call with every reference in its parameters replaced by the value it
+/// names in `earlier`, and every `$$` escape read as one `$`.
+fn fill_references(call: &Value, earlier: &[Value]) -> Result<Value, BrpError> {
+    fn fill(value: &mut Value, earlier: &[Value]) -> Result<(), BrpError> {
+        match value {
+            Value::String(text) => {
+                if let Some(literal) = text.strip_prefix("$$") {
+                    *text = format!("${literal}");
+                    return Ok(());
+                }
+                let Some(reference) = parse_reference(text).map_err(invalid_params)? else {
+                    return Ok(());
+                };
+                let mut found = earlier.get(reference.call);
+                for segment in &reference.path {
+                    found = found.and_then(|at| match at {
+                        Value::Array(items) => {
+                            segment.parse::<usize>().ok().and_then(|i| items.get(i))
+                        }
+                        other => other.get(segment),
+                    });
+                }
+                let found = found.filter(|found| !found.is_null()).ok_or_else(|| {
+                    invalid_params(format!(
+                        "`{text}`: call {} reported no such value",
+                        reference.call
+                    ))
+                })?;
+                *value = found.clone();
+            }
+            Value::Array(items) => {
+                for item in items {
+                    fill(item, earlier)?;
+                }
+            }
+            Value::Object(fields) => {
+                for field in fields.values_mut() {
+                    fill(field, earlier)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let mut call = call.clone();
+    if let Some(params) = call.get_mut("params") {
+        fill(params, earlier)?;
+    }
+    Ok(call)
 }
 
 /// End the modal operator holding the editor, if one is. A modal call over the
 /// remote has no pointer to finish it, and blocks every later modal call.
 pub fn cancel_handler(In(_): In<Option<Value>>, world: &mut World) -> BrpResult {
     check_enabled(world)?;
+    super::paced::refuse_while_playing(world, "jackdaw/cancel")?;
     let active = world
         .run_system_cached(active_modal)
         .map_err(|err| internal_error(err.to_string()))?;
@@ -685,14 +1287,16 @@ pub fn cancel_handler(In(_): In<Option<Value>>, world: &mut World) -> BrpResult 
 
 /// One prepared call: an id, its typed parameters, and how each `Entity`
 /// parameter was filled in.
-struct PreparedCall {
+pub(super) struct PreparedCall {
     op: BootOp,
     unresolved: Vec<String>,
+    /// A reference named nothing, or too much, so the call is refused unrun.
+    blocked: bool,
 }
 
 /// What a call did.
 #[derive(Serialize)]
-struct CallOutcome {
+pub(super) struct CallOutcome {
     id: String,
     /// `finished`, `cancelled` or `running`.
     result: String,
@@ -700,16 +1304,65 @@ struct CallOutcome {
     /// reported through `OperatorWarnings`. Empty on a clean call.
     warnings: Vec<String>,
     /// Scene entities the call added, as ids the other methods take.
-    entities: Vec<u64>,
+    pub(super) entities: Vec<u64>,
     /// What the operator did, where the amount is the answer and the scene does
     /// not say it. Kept apart from `warnings` so a receipt is not read as a
     /// refusal.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     reports: Vec<String>,
+    /// `changed`, `empty`, `unchanged` or `invalid`, from an operator that says
+    /// which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'static str>,
+    /// Scene entities the call took away, from an operator that replaces them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<u64>,
+    /// Scene entities the call made in their place.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    created: Vec<u64>,
+    /// The world-space `[min, max]` box of each of `created`, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bounds: Vec<Value>,
+    /// What a boolean made or, on a dry run, would make.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<Value>,
+}
+
+impl CallOutcome {
+    /// The outcome as a caller reads it. Compact leaves out the operator id the
+    /// caller already sent and every empty list but `entities`.
+    pub(super) fn to_json(&self, verbose: bool) -> Value {
+        let mut value = json!(self);
+        if !verbose && let Some(fields) = value.as_object_mut() {
+            fields.remove("id");
+            fields.retain(|name, field| {
+                name == "entities" || field.as_array().is_none_or(|items| !items.is_empty())
+            });
+        }
+        value
+    }
 }
 
 /// Type a `{id, params}` object into a call the dispatcher can take.
-fn call_from_json(world: &mut World, call: &Value) -> Result<PreparedCall, BrpError> {
+pub(super) fn call_from_json(world: &mut World, call: &Value) -> Result<PreparedCall, BrpError> {
+    let mut op = typed_call(world, call)?;
+    let outcomes = resolve_entity_params(world, &mut op);
+    let blocked = crate::boot_ops::blocked(&outcomes);
+    let unresolved = outcomes
+        .into_iter()
+        .filter(crate::boot_ops::EntityParam::is_refusal)
+        .filter_map(|outcome| outcome.line(&op.id))
+        .collect();
+    Ok(PreparedCall {
+        op,
+        unresolved,
+        blocked,
+    })
+}
+
+/// Check a call's operator exists and type its parameters from the schema,
+/// leaving entity parameters unresolved.
+fn typed_call(world: &mut World, call: &Value) -> Result<BootOp, BrpError> {
     let id = call
         .get("id")
         .and_then(Value::as_str)
@@ -736,23 +1389,42 @@ fn call_from_json(world: &mut World, call: &Value) -> Result<PreparedCall, BrpEr
         }
     }
 
-    let mut op = BootOp { id, params };
-    let unresolved = resolve_entity_params(world, &mut op)
-        .into_iter()
-        .filter(crate::boot_ops::EntityParam::is_refusal)
-        .filter_map(|outcome| outcome.line(&op.id))
-        .collect();
-    Ok(PreparedCall { op, unresolved })
+    Ok(BootOp { id, params })
 }
 
 /// Dispatch a prepared call and describe what happened.
-fn dispatch(world: &mut World, call: PreparedCall, history: bool) -> Result<CallOutcome, BrpError> {
-    let PreparedCall { op, unresolved } = call;
+pub(super) fn dispatch(
+    world: &mut World,
+    call: PreparedCall,
+    history: bool,
+) -> Result<CallOutcome, BrpError> {
+    let PreparedCall {
+        op,
+        unresolved,
+        blocked,
+    } = call;
     let id = op.id.clone();
+    if blocked {
+        return Ok(CallOutcome {
+            id,
+            result: "cancelled".to_string(),
+            warnings: unresolved,
+            entities: Vec::new(),
+            reports: Vec::new(),
+            outcome: Some(jackdaw_api_internal::operator::Outcome::Invalid.as_str()),
+            removed: Vec::new(),
+            created: Vec::new(),
+            bounds: Vec::new(),
+            report: None,
+        });
+    }
     // Anything the operator itself wants the caller told. Cleared first,
     // so a warning from an earlier call is not reported against this one.
     world.get_resource_or_init::<OperatorWarnings>().0.clear();
     world.get_resource_or_init::<OperatorReports>().0.clear();
+    world
+        .get_resource_or_init::<OperatorBooleanReport>()
+        .request();
     crate::commands::SpawnedEntities::watch(world);
     let params = OperatorParameters(op.params.into_iter().collect());
     let run = |world: &mut World| {
@@ -780,6 +1452,19 @@ fn dispatch(world: &mut World, call: PreparedCall, history: bool) -> Result<Call
 
     let mut warnings = unresolved;
     warnings.append(&mut world.get_resource_or_init::<OperatorWarnings>().0);
+    let (removed, created) = world.get_resource_or_init::<OperatorReplacements>().take();
+    let created: Vec<Entity> = created
+        .into_iter()
+        .filter(|&entity| world.get_entity(entity).is_ok())
+        .collect();
+    let bounds = created
+        .iter()
+        .map(|&entity| {
+            super::summary::world_bounds(world, entity).map_or(Value::Null, |(min, max)| {
+                json!([super::summary::vector(min), super::summary::vector(max)])
+            })
+        })
+        .collect();
 
     Ok(CallOutcome {
         id,
@@ -795,6 +1480,34 @@ fn dispatch(world: &mut World, call: PreparedCall, history: bool) -> Result<Call
             .map(Entity::to_bits)
             .collect(),
         reports: std::mem::take(&mut world.get_resource_or_init::<OperatorReports>().0),
+        outcome: world
+            .get_resource_or_init::<OperatorOutcome>()
+            .take()
+            .map(jackdaw_api_internal::operator::Outcome::as_str),
+        removed: removed.into_iter().map(Entity::to_bits).collect(),
+        created: created.into_iter().map(Entity::to_bits).collect(),
+        bounds,
+        report: world
+            .get_resource_or_init::<OperatorBooleanReport>()
+            .take()
+            .as_ref()
+            .map(boolean_report_json),
+    })
+}
+
+fn boolean_report_json(report: &BooleanReport) -> Value {
+    use super::summary::{round, vector};
+    json!({
+        "outcome": report.outcome.as_str(),
+        "fragments": report.fragments,
+        "volume": [round(report.volume_before), round(report.volume_after)],
+        "bounds": report
+            .bounds
+            .map_or(Value::Null, |(min, max)| json!([vector(min), vector(max)])),
+        "watertight": report.watertight,
+        "cut_faces": report.cut_faces,
+        "coplanar": report.coplanar,
+        "degenerate": report.degenerate,
     })
 }
 
@@ -810,41 +1523,119 @@ fn spawned_by_the_call(world: &mut World) -> Vec<Entity> {
 
 /// The scene as the outliner shows it. `root` names the node to report and
 /// `depth` counts generations below it; absent, they mean the whole scene.
+/// `filter` is an entity reference: the nodes it matches (within `root`, when
+/// given) are reported as the roots, the topmost one where one sits under
+/// another.
 pub fn scene_tree_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
     check_enabled(world)?;
     let params = params.unwrap_or(Value::Null);
-    let depth = params
-        .get("depth")
-        .and_then(Value::as_u64)
-        .unwrap_or(u64::from(u32::MAX)) as u32;
+    let depth = depth_param(&params)?;
 
-    let asked_for = named_root(&params)?;
-    let named = asked_for.is_some();
-    let roots = match asked_for {
-        None => {
-            let mut query = world.query_filtered::<Entity, Without<ChildOf>>();
-            query.iter(world).collect::<Vec<_>>()
-        }
-        Some(root) => vec![entity_from_params(world, &root)?],
+    let asked_for = root_param(world, &params)?;
+    // A named root may be a row inside a UI screen, which is not a scene root.
+    let roots: Vec<Entity> = match asked_for {
+        None => scene_roots(world),
+        Some(root) => vec![root]
+            .into_iter()
+            .filter(|entity| belongs_to_the_scene(world, *entity))
+            .collect(),
     };
-
-    // A named root may be a row inside a UI screen, which is not a scene root;
-    // the whole scene is narrowed to the rows the outliner would draw.
-    let roots: Vec<Entity> = roots
-        .into_iter()
-        .filter(|entity| {
-            if named {
-                belongs_to_the_scene(world, *entity)
-            } else {
-                is_scene_node(world, *entity)
-            }
-        })
-        .collect();
+    let roots = match filter_param(world, &params)? {
+        None => roots,
+        Some(matched) => {
+            let kept: Vec<Entity> = matched
+                .into_iter()
+                .filter(|&entity| {
+                    belongs_to_the_scene(world, entity)
+                        && asked_for.is_none_or(|root| is_at_or_under(world, entity, root))
+                })
+                .collect();
+            let kept_set: EntityHashSet = kept.iter().copied().collect();
+            kept.into_iter()
+                .filter(|&entity| !has_ancestor_in(world, entity, &kept_set))
+                .collect()
+        }
+    };
     let tree: Vec<Value> = roots
         .into_iter()
         .map(|entity| node_json(world, entity, depth))
         .collect();
     Ok(json!({ "tree": tree }))
+}
+
+/// The nodes a read's `filter` reference matches, in outliner order. A
+/// reference that matches nothing reads as no nodes; a malformed one is
+/// refused.
+pub(super) fn filter_param(
+    world: &mut World,
+    params: &Value,
+) -> Result<Option<Vec<Entity>>, BrpError> {
+    let text = match params.get("filter") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(text)) => text,
+        Some(other) => {
+            return Err(invalid_params(format!(
+                "`filter` is an entity reference such as \"#roof\", not {other}"
+            )));
+        }
+    };
+    reference_matches(world, text).map(Some)
+}
+
+/// What a reference in a read matches: nothing is an answer, malformed text is
+/// refused.
+pub(super) fn reference_matches(world: &mut World, text: &str) -> Result<Vec<Entity>, BrpError> {
+    match crate::entity_refs::resolve(world, text) {
+        Ok(found) => Ok(found),
+        Err(crate::entity_refs::RefError::NoMatch) => Ok(Vec::new()),
+        Err(err) => Err(invalid_params(err.describe(text))),
+    }
+}
+
+/// Whether any ancestor of `entity` (not itself) is in `set`.
+fn has_ancestor_in(world: &World, entity: Entity, set: &EntityHashSet) -> bool {
+    let mut current = world.get::<ChildOf>(entity).map(ChildOf::parent);
+    while let Some(at) = current {
+        if set.contains(&at) {
+            return true;
+        }
+        current = world.get::<ChildOf>(at).map(ChildOf::parent);
+    }
+    false
+}
+
+/// Whether `entity` is `ancestor` or sits somewhere below it.
+fn is_at_or_under(world: &World, entity: Entity, ancestor: Entity) -> bool {
+    let mut current = Some(entity);
+    while let Some(at) = current {
+        if at == ancestor {
+            return true;
+        }
+        current = world.get::<ChildOf>(at).map(ChildOf::parent);
+    }
+    false
+}
+
+/// The `depth` a read asks for: generations below its root, all when absent.
+pub(super) fn depth_param(params: &Value) -> Result<u32, BrpError> {
+    match params.get("depth") {
+        None | Some(Value::Null) => Ok(u32::MAX),
+        Some(given) => given
+            .as_u64()
+            .and_then(|depth| u32::try_from(depth).ok())
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "`depth` is a non-negative whole number, not {given}"
+                ))
+            }),
+    }
+}
+
+/// The entity a read's `root` (or `entity` / `name`) names, if any.
+pub(super) fn root_param(world: &mut World, params: &Value) -> Result<Option<Entity>, BrpError> {
+    named_root(params)?
+        .map(|root| entity_from_params(world, &root))
+        .transpose()
 }
 
 /// The node a `root` field asks for, as an entity id or a name. `entity` and
@@ -866,7 +1657,7 @@ fn named_root(params: &Value) -> Result<Option<Value>, BrpError> {
 
 /// Whether the outliner would draw a root row for `entity`, asking the same
 /// questions `crate::hierarchy::queue_root_row_spawn` does.
-fn is_scene_node(world: &World, entity: Entity) -> bool {
+pub(super) fn is_scene_node(world: &World, entity: Entity) -> bool {
     if is_editor_furniture(world, entity) {
         return false;
     }
@@ -876,11 +1667,21 @@ fn is_scene_node(world: &World, entity: Entity) -> bool {
             .is_some()
 }
 
+/// The scene nodes at the top of the hierarchy, in query order.
+pub(crate) fn scene_roots(world: &mut World) -> Vec<Entity> {
+    let mut query = world.query_filtered::<Entity, Without<ChildOf>>();
+    let roots: Vec<Entity> = query.iter(world).collect();
+    roots
+        .into_iter()
+        .filter(|entity| is_scene_node(world, *entity))
+        .collect()
+}
+
 /// Whether a node under a scene node belongs in the tree. A UI node carries
 /// `UiTransform` rather than `Transform`, so under a scene root `Node` counts
 /// too; at the top level it would take in the editor's own chrome, which is
 /// `Node` all the way down and carries no scene marker.
-fn is_scene_descendant(world: &World, entity: Entity) -> bool {
+pub(crate) fn is_scene_descendant(world: &World, entity: Entity) -> bool {
     if is_editor_furniture(world, entity) {
         return false;
     }
@@ -890,7 +1691,7 @@ fn is_scene_descendant(world: &World, entity: Entity) -> bool {
 /// Whether `entity` is in the open scene: a scene node, or a UI node under
 /// one. The editor's own chrome is `Node` all the way up to a root that is no
 /// scene node at all, so naming a piece of it reaches nothing.
-fn belongs_to_the_scene(world: &World, entity: Entity) -> bool {
+pub(crate) fn belongs_to_the_scene(world: &World, entity: Entity) -> bool {
     let mut current = entity;
     for _ in 0..MAX_SCENE_DEPTH {
         if is_editor_furniture(world, current) {
@@ -1001,6 +1802,7 @@ fn terrain_masks(world: &World, entity: Entity) -> Option<Value> {
 /// Spawn BSN text into the open scene, optionally under a chosen node.
 pub fn apply_bsn_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
     check_enabled(world)?;
+    super::paced::refuse_while_playing(world, "jackdaw/apply_bsn")?;
     let params = params.ok_or_else(|| invalid_params("expected {\"source\": \"<bsn text>\"}"))?;
     let parent = match params.get("parent") {
         None | Some(Value::Null) => None,
@@ -1359,6 +2161,9 @@ const STALE_FRAMES: u32 = 120;
 /// Registered as a watching method with no `+watch` in its name, so the HTTP
 /// layer holds the connection while the handler is polled each frame: the
 /// capture operator returns long before the GPU readback lands.
+///
+/// `look_at: {eye, target}` aims the viewport camera before the capture and
+/// puts it back once the capture lands, unless `keep_camera` is true.
 pub fn screenshot_handler(
     In(params): In<Option<Value>>,
     world: &mut World,
@@ -1370,81 +2175,291 @@ pub fn screenshot_handler(
         .and_then(Value::as_str)
         .unwrap_or("viewport")
         .to_string();
-    let path = match params.get("path").and_then(Value::as_str) {
-        Some(path) => project_path(world, path)?,
-        None => default_capture_path(world, &kind),
-    };
-    let region = capture_region(&params)?;
     let key = request_key(&params);
 
     let frame = current_frame(world);
     expire_stale(world, frame);
 
-    let known = world
-        .get_resource_or_init::<PendingWaits>()
-        .requests
-        .contains_key(&key);
-    if !known {
-        // A capture a previous holder of this path left behind is not this
-        // request's answer.
-        if let Some(mut log) = world.get_resource_mut::<crate::screenshot::CaptureLog>() {
-            log.forget(&path);
-        }
-        let queue = path.clone();
-        let outcome = match kind.as_str() {
-            "window" => crate::screenshot::queue_window_capture(world, queue, false, region),
-            "viewport2d" => crate::screenshot::queue_2d_capture(world, queue, false, region),
-            _ => crate::screenshot::queue_capture(world, queue, false, region),
-        };
-        if let Err(err) = outcome {
-            return Err(match err {
-                CaptureError::NoViewport | CaptureError::NotAnImageTarget => {
-                    internal_error(err.to_string())
-                }
-                CaptureError::WorldRegionWithoutView
-                | CaptureError::WorldRegionOnUiScene
-                | CaptureError::EmptyRegion => invalid_params(err.to_string()),
-            });
-        }
-        world
-            .get_resource_or_init::<PendingWaits>()
-            .requests
-            .insert(
-                key.clone(),
-                PendingRequest {
-                    last_seen: frame,
-                    state: PendingState::Capture { path: path.clone() },
-                },
-            );
-        return Ok(None);
-    }
-
-    if let Some(pending) = world
+    // A default path carries a timestamp, so it is made once, when the capture
+    // is queued, and read back from the request on every later poll.
+    let found = match world
         .get_resource_or_init::<PendingWaits>()
         .requests
         .get_mut(&key)
     {
-        pending.last_seen = frame;
-    }
+        // The HTTP layer polls once more after the answer goes out; that
+        // poll's error reaches no one, and a reused id hears why.
+        Some(PendingRequest {
+            state: PendingState::Answered,
+            ..
+        }) => Some(None),
+        Some(pending) => match &pending.state {
+            PendingState::Capture { path, queued, .. } => {
+                let found = (path.clone(), *queued);
+                pending.last_seen = frame;
+                Some(Some(found))
+            }
+            _ => None,
+        },
+        None => None,
+    };
+    let path = match found {
+        Some(None) => {
+            return Err(invalid_params(format!(
+                "screenshot request {key} was already answered; give each screenshot its own id"
+            )));
+        }
+        // Aimed on the last poll: the camera's new place has been propagated
+        // since, so the capture sees the aimed view.
+        Some(Some((path, false))) => {
+            if let Err(err) = queue_shot(world, &params, &kind, &path) {
+                if let Some(pending) = world
+                    .get_resource_or_init::<PendingWaits>()
+                    .requests
+                    .remove(&key)
+                    && let PendingState::Capture { aim: Some(aim), .. } = pending.state
+                {
+                    aim.put_back(world);
+                }
+                return Err(err);
+            }
+            if let Some(PendingRequest {
+                state: PendingState::Capture { queued, .. },
+                ..
+            }) = world
+                .get_resource_or_init::<PendingWaits>()
+                .requests
+                .get_mut(&key)
+            {
+                *queued = true;
+            }
+            return Ok(None);
+        }
+        Some(Some((path, true))) => path,
+        None => {
+            let path = match params.get("path").and_then(Value::as_str) {
+                Some(path) => project_path(world, path)?,
+                None => default_capture_path(world, &kind),
+            };
+            capture_region(&params)?;
+            thumbnail_request(&params)?;
+            let aim = match look_at_request(&params)? {
+                Some((eye, target)) => {
+                    if !key.starts_with("id:") {
+                        return Err(invalid_params(
+                            "a screenshot with `look_at` needs a `request` id, so the poll after \
+                             its answer does not aim and capture again",
+                        ));
+                    }
+                    if aimed_capture_in_flight(world) {
+                        return Err(invalid_params(
+                            "another screenshot with `look_at` is still capturing; wait for it",
+                        ));
+                    }
+                    let keep_camera = flag(&params, "keep_camera")?;
+                    let before = (!keep_camera)
+                        .then(|| crate::view_ops::CameraPose::of_active(world))
+                        .flatten();
+                    aim_camera(world, eye, target)?;
+                    Some(Box::new(Aim {
+                        before,
+                        aimed: crate::view_ops::CameraPose::of_active(world),
+                    }))
+                }
+                None => {
+                    queue_shot(world, &params, &kind, &path)?;
+                    None
+                }
+            };
+            let queued = aim.is_none();
+            world
+                .get_resource_or_init::<PendingWaits>()
+                .requests
+                .insert(
+                    key,
+                    PendingRequest {
+                        last_seen: frame,
+                        state: PendingState::Capture { path, queued, aim },
+                    },
+                );
+            return Ok(None);
+        }
+    };
 
-    let landed = world
-        .get_resource::<crate::screenshot::CaptureLog>()
-        .and_then(|log| log.size_of(&path));
-    let Some((width, height)) = landed else {
+    let mut log = world.get_resource_or_init::<crate::screenshot::CaptureLog>();
+    let Some((width, height)) = log.size_of(&path) else {
         return Ok(None);
     };
-    if let Some(mut log) = world.get_resource_mut::<crate::screenshot::CaptureLog>() {
-        log.forget(&path);
+    let thumbnail = log.take_thumbnail(&path);
+    log.forget(&path);
+    let finished = {
+        let mut waits = world.get_resource_or_init::<PendingWaits>();
+        // Only a request with its own id can be told from a new one spelled
+        // the same, so only that kind is remembered as answered. The frame it
+        // was answered on is kept, so the memory expires however often it is
+        // polled.
+        if key.starts_with("id:") {
+            waits.requests.get_mut(&key).map(|pending| {
+                pending.last_seen = frame;
+                std::mem::replace(&mut pending.state, PendingState::Answered)
+            })
+        } else {
+            waits.requests.remove(&key).map(|pending| pending.state)
+        }
+    };
+    if let Some(PendingState::Capture { aim: Some(aim), .. }) = finished {
+        aim.put_back(world);
     }
-    world
-        .get_resource_or_init::<PendingWaits>()
-        .requests
-        .remove(&key);
-    Ok(Some(json!({
+    let mut answer = json!({
         "path": path,
         "width": width,
         "height": height,
-    })))
+    });
+    match thumbnail {
+        Some(Ok(thumb)) => {
+            answer["thumb"] = json!({
+                "path": thumb.path,
+                "width": thumb.width,
+                "height": thumb.height,
+            });
+        }
+        // The capture itself landed; a caller can still read it at full size.
+        Some(Err(err)) => answer["warnings"] = json!([err]),
+        None => {}
+    }
+    Ok(Some(answer))
+}
+
+/// A camera a screenshot aimed: where it stood before, unless the caller
+/// keeps it aimed, and where the aim put it.
+struct Aim {
+    before: Option<crate::view_ops::CameraPose>,
+    aimed: Option<crate::view_ops::CameraPose>,
+}
+
+impl Aim {
+    /// Put the camera back, unless someone has moved it off the aimed pose
+    /// since.
+    fn put_back(self, world: &mut World) {
+        let untouched = self.aimed.is_some_and(|aimed| aimed.is_current(world));
+        if let Some(before) = self.before
+            && untouched
+        {
+            before.restore(world);
+        }
+    }
+}
+
+/// Whether a screenshot that aimed the camera has not answered yet.
+fn aimed_capture_in_flight(world: &mut World) -> bool {
+    world
+        .get_resource_or_init::<PendingWaits>()
+        .requests
+        .values()
+        .any(|pending| matches!(pending.state, PendingState::Capture { aim: Some(_), .. }))
+}
+
+/// Queue the capture a screenshot request names, at `path`.
+fn queue_shot(world: &mut World, params: &Value, kind: &str, path: &Path) -> BrpResult<()> {
+    let region = capture_region(params)?;
+    let thumbnail = thumbnail_request(params)?;
+    // A capture a previous holder of this path left behind is not this
+    // request's answer.
+    {
+        let mut log = world.get_resource_or_init::<crate::screenshot::CaptureLog>();
+        log.forget(path);
+        if let Some((max_px, format)) = thumbnail {
+            log.want_thumbnail(path.to_path_buf(), max_px, format);
+        }
+    }
+    let queue = path.to_path_buf();
+    let outcome = match kind {
+        "window" => crate::screenshot::queue_window_capture(world, queue, false, region),
+        "viewport2d" => crate::screenshot::queue_2d_capture(world, queue, false, region),
+        _ => crate::screenshot::queue_capture(world, queue, false, region),
+    };
+    let Err(err) = outcome else {
+        return Ok(());
+    };
+    world
+        .get_resource_or_init::<crate::screenshot::CaptureLog>()
+        .forget(path);
+    Err(match err {
+        CaptureError::NoViewport | CaptureError::NotAnImageTarget => {
+            internal_error(err.to_string())
+        }
+        CaptureError::WorldRegionWithoutView
+        | CaptureError::WorldRegionOnUiScene
+        | CaptureError::EmptyRegion => invalid_params(err.to_string()),
+    })
+}
+
+/// The eye and target a screenshot's `look_at: {eye, target}` names; the
+/// target defaults to the origin.
+fn look_at_request(params: &Value) -> BrpResult<Option<(Vec3, Vec3)>> {
+    let Some(look_at) = params.get("look_at").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let point = |key: &str, default: Option<Vec3>| -> BrpResult<Vec3> {
+        match look_at.get(key).filter(|value| !value.is_null()) {
+            None => default.ok_or_else(|| invalid_params("`look_at` needs an `eye` [x, y, z]")),
+            Some(value) => vec_of(value, 3)
+                .map(|v| Vec3::new(v[0], v[1], v[2]))
+                .ok_or_else(|| {
+                    invalid_params(format!("`look_at.{key}` = {value} is not [x, y, z]"))
+                }),
+        }
+    };
+    Ok(Some((
+        point("eye", None)?,
+        point("target", Some(Vec3::ZERO))?,
+    )))
+}
+
+/// Aim the viewport camera with `view.look_at`.
+fn aim_camera(world: &mut World, eye: Vec3, target: Vec3) -> BrpResult<()> {
+    let result = world
+        .operator("view.look_at")
+        .param("eye_x", f64::from(eye.x))
+        .param("eye_y", f64::from(eye.y))
+        .param("eye_z", f64::from(eye.z))
+        .param("target_x", f64::from(target.x))
+        .param("target_y", f64::from(target.y))
+        .param("target_z", f64::from(target.z))
+        .call()
+        .map_err(|err| internal_error(err.to_string()))?;
+    if matches!(result, OperatorResult::Finished) {
+        Ok(())
+    } else {
+        Err(invalid_params(
+            "`look_at` could not aim the camera: no 3D viewport, or the eye is the target",
+        ))
+    }
+}
+
+/// The thumbnail a screenshot request asks for: `max_px` on the longer side,
+/// in `format` (`png`, the default, or `jpeg`). None without `max_px`.
+fn thumbnail_request(
+    params: &Value,
+) -> BrpResult<Option<(u32, crate::screenshot::ThumbnailFormat)>> {
+    let Some(max_px) = params.get("max_px").filter(|max| !max.is_null()) else {
+        return Ok(None);
+    };
+    let max_px = max_px
+        .as_u64()
+        .and_then(|max| u32::try_from(max).ok())
+        .filter(|max| *max > 0)
+        .ok_or_else(|| invalid_params(format!("`max_px` = {max_px} is not a positive size")))?;
+    let format = match params.get("format").and_then(Value::as_str) {
+        None | Some("png") => crate::screenshot::ThumbnailFormat::Png,
+        Some("jpeg" | "jpg") => crate::screenshot::ThumbnailFormat::Jpeg,
+        Some(other) => {
+            return Err(invalid_params(format!(
+                "`format` = {other}: expected `png` or `jpeg`"
+            )));
+        }
+    };
+    Ok(Some((max_px, format)))
 }
 
 /// The `region` a screenshot request names: `{x, y, w, h, space}` with the
@@ -1466,6 +2481,452 @@ fn default_capture_path(world: &World, kind: &str) -> PathBuf {
         |p| p.root.join("screenshots"),
     );
     dir.join(format!("{kind}-{stamp}.png"))
+}
+
+/// Render offscreen views of `targets` and answer with one sheet once every
+/// tile is back. Each view has its own camera framed on the targets' bounds;
+/// the viewport camera does not move.
+///
+/// Watching like `jackdaw/screenshot`: the first poll validates and queues,
+/// later polls answer once the readbacks have landed.
+pub fn views_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult<Option<Value>> {
+    check_enabled(world)?;
+    let params = params.unwrap_or(Value::Null);
+    let key = request_key(&params);
+    let frame = current_frame(world);
+    expire_stale(world, frame);
+
+    let found = match world
+        .get_resource_or_init::<PendingWaits>()
+        .requests
+        .get_mut(&key)
+    {
+        None => None,
+        Some(pending) => match &pending.state {
+            PendingState::Views(job) => {
+                pending.last_seen = frame;
+                Some((job.request, job.tiles.len()))
+            }
+            _ => {
+                return Err(invalid_params(format!(
+                    "views request {key} was already answered; give each call its own id"
+                )));
+            }
+        },
+    };
+    let Some((request, count)) = found else {
+        if !key.starts_with("id:") {
+            return Err(invalid_params(
+                "views needs a `request` id, so the poll after its answer does not render again",
+            ));
+        }
+        let job = plan_views(world, &params)?;
+        world
+            .get_resource_or_init::<PendingWaits>()
+            .requests
+            .insert(
+                key,
+                PendingRequest {
+                    last_seen: frame,
+                    state: PendingState::Views(Box::new(job)),
+                },
+            );
+        return Ok(None);
+    };
+    let Some(images) = crate::views::take_landed(world, request, count) else {
+        return Ok(None);
+    };
+    let finished = {
+        let mut waits = world.get_resource_or_init::<PendingWaits>();
+        if key.starts_with("id:") {
+            waits.requests.get_mut(&key).map(|pending| {
+                pending.last_seen = frame;
+                std::mem::replace(&mut pending.state, PendingState::Answered)
+            })
+        } else {
+            waits.requests.remove(&key).map(|pending| pending.state)
+        }
+    };
+    let Some(PendingState::Views(job)) = finished else {
+        return Ok(None);
+    };
+    let ViewsJob {
+        request,
+        tiles,
+        layout,
+        format,
+        path,
+        isolation,
+        bounds,
+    } = *job;
+    let late = crate::views::was_late(world, request);
+    crate::views::finish(world, request, isolation);
+    let mut answer = write_views(&tiles, layout, format, &path, &images, bounds)?;
+    if late {
+        answer["warnings"] = json!([
+            "the renderer was still compiling when the views were read back; tiles may be \
+             blank, so call again"
+        ]);
+    }
+    Ok(Some(answer))
+}
+
+/// Largest edge of a tile written to its own file, in pixels.
+const MAX_TILE_FILE_EDGE: u32 = 1024;
+/// Most pixels the tiles of one call may add up to when written one per file.
+const MAX_TILE_FILE_PIXELS: u64 = 4 * 1024 * 1024;
+
+/// A views request between its first poll and its answer.
+struct ViewsJob {
+    request: u64,
+    tiles: Vec<ViewTileLabel>,
+    /// The sheet the tiles go on; `None` writes each tile to its own file.
+    layout: Option<crate::views::SheetLayout>,
+    format: crate::screenshot::ThumbnailFormat,
+    path: PathBuf,
+    isolation: Option<crate::views::Isolation>,
+    bounds: (Vec3, Vec3),
+}
+
+struct ViewTileLabel {
+    label: String,
+    target: Option<Entity>,
+}
+
+/// Check a views request and queue its cameras. Nothing is queued when any
+/// parameter is wrong.
+fn plan_views(world: &mut World, params: &Value) -> BrpResult<ViewsJob> {
+    use crate::views::{MAX_EDGE, MAX_TILES, MIN_TILE, SheetLayout, TilePlan};
+
+    let targets = view_targets(world, params)?;
+    let per_target = flag(params, "per_target")?;
+    let angles = view_angles(params, per_target)?;
+    let max_px = match params.get("max_px").filter(|max| !max.is_null()) {
+        None => 512,
+        Some(max) => max
+            .as_u64()
+            .and_then(|max| u32::try_from(max).ok())
+            .filter(|max| (MIN_TILE..=MAX_EDGE).contains(max))
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "`max_px` = {max} is not a size from {MIN_TILE} to {MAX_EDGE}"
+                ))
+            })?,
+    };
+    let format = match params.get("format").and_then(Value::as_str) {
+        None | Some("jpeg" | "jpg") => crate::screenshot::ThumbnailFormat::Jpeg,
+        Some("png") => crate::screenshot::ThumbnailFormat::Png,
+        Some(other) => {
+            return Err(invalid_params(format!(
+                "`format` = {other}: expected `png` or `jpeg`"
+            )));
+        }
+    };
+    let sheet = match params.get("sheet") {
+        None | Some(Value::Null) => true,
+        _ => flag(params, "sheet")?,
+    };
+    let isolate = flag(params, "isolate")?;
+
+    let measured: Vec<(Entity, Option<(Vec3, Vec3)>)> = targets
+        .iter()
+        .map(|target| (*target, super::summary::world_bounds(world, *target)))
+        .collect();
+    let bounded: Vec<(Entity, (Vec3, Vec3))> = measured
+        .iter()
+        .map(|(target, bounds)| (*target, bounds.unwrap_or_else(|| unit_box(world, *target))))
+        .collect();
+    // Lights, cameras and markers have no bounds; they are framed only when
+    // nothing named has any.
+    let union = |(min, max): (Vec3, Vec3), (lo, hi): (Vec3, Vec3)| (min.min(lo), max.max(hi));
+    let bounds = measured
+        .iter()
+        .filter_map(|(_, bounds)| *bounds)
+        .reduce(union)
+        .or_else(|| bounded.iter().map(|(_, bounds)| *bounds).reduce(union))
+        .ok_or_else(|| invalid_params("nothing to view"))?;
+    let framed: Vec<(Option<Entity>, (Vec3, Vec3))> = if per_target {
+        bounded
+            .iter()
+            .map(|(target, bounds)| (Some(*target), *bounds))
+            .collect()
+    } else {
+        vec![(None, bounds)]
+    };
+    let count = framed.len() * angles.len();
+    if count > MAX_TILES {
+        return Err(invalid_params(format!(
+            "{count} views asked for; at most {MAX_TILES} fit one call"
+        )));
+    }
+    let layout = if sheet {
+        let columns = (per_target && angles.len() > 1).then_some(angles.len());
+        Some(SheetLayout::new(count, columns, max_px).ok_or_else(|| {
+            invalid_params(format!(
+                "`max_px` = {max_px} leaves {count} tiles under {MIN_TILE} px each"
+            ))
+        })?)
+    } else {
+        if max_px > MAX_TILE_FILE_EDGE {
+            return Err(invalid_params(format!(
+                "`max_px` = {max_px}: a tile written on its own is at most \
+                 {MAX_TILE_FILE_EDGE} px; ask for a sheet or a smaller size"
+            )));
+        }
+        let pixels = count as u64 * u64::from(max_px) * u64::from(max_px);
+        if pixels > MAX_TILE_FILE_PIXELS {
+            return Err(invalid_params(format!(
+                "{count} tiles of {max_px} px are {pixels} pixels, over the \
+                 {MAX_TILE_FILE_PIXELS} one call may write; ask for fewer or smaller tiles"
+            )));
+        }
+        None
+    };
+    if world
+        .get_resource_or_init::<PendingWaits>()
+        .requests
+        .values()
+        .any(|pending| matches!(pending.state, PendingState::Views(_)))
+    {
+        return Err(invalid_params(
+            "another views request is still rendering; wait for it",
+        ));
+    }
+    let path = match params.get("path").and_then(Value::as_str) {
+        Some(path) => project_path(world, path)?,
+        None => default_capture_path(world, "views"),
+    }
+    .with_extension(format.extension());
+
+    let mut plans = Vec::with_capacity(count);
+    let mut tiles = Vec::with_capacity(count);
+    for (target, bounds) in &framed {
+        for angle in &angles {
+            let (transform, projection) = crate::views::frame(*angle, *bounds);
+            let label = match target {
+                Some(target) => format!("{} {}", view_name(world, *target), angle.label()),
+                None => angle.label().to_string(),
+            };
+            plans.push(TilePlan {
+                label: label.clone(),
+                target: *target,
+                transform,
+                projection,
+            });
+            tiles.push(ViewTileLabel {
+                label,
+                target: *target,
+            });
+        }
+    }
+    let edge = layout.map_or(max_px, |layout| layout.tile);
+    let isolated = isolate.then_some(targets.as_slice());
+    let (request, isolation) = crate::views::start(world, &plans, edge, isolated);
+    Ok(ViewsJob {
+        request,
+        tiles,
+        layout,
+        format,
+        path,
+        isolation,
+        bounds,
+    })
+}
+
+/// The entities a views request names, or the selection, or every scene root.
+fn view_targets(world: &mut World, params: &Value) -> BrpResult<Vec<Entity>> {
+    let named = match params.get("targets") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(targets)) if !targets.is_empty() => Some(targets.clone()),
+        Some(other) => {
+            return Err(invalid_params(format!(
+                "`targets` is a list of entity ids or names, not {other}"
+            )));
+        }
+    };
+    let targets: Vec<Entity> = match named {
+        Some(named) => {
+            let mut targets = Vec::with_capacity(named.len());
+            let mut seen = EntityHashSet::default();
+            for target in &named {
+                let entity = match target {
+                    Value::Number(_) => entity_from_params(world, &json!({ "entity": target }))?,
+                    Value::String(_) => entity_from_params(world, &json!({ "name": target }))?,
+                    other => {
+                        return Err(invalid_params(format!(
+                            "a target is an entity id or a name, not {other}"
+                        )));
+                    }
+                };
+                if !belongs_to_the_scene(world, entity) {
+                    return Err(invalid_params(format!("{target} is not in the open scene")));
+                }
+                if seen.insert(entity) {
+                    targets.push(entity);
+                }
+            }
+            targets
+        }
+        None => {
+            let selected: Vec<Entity> = world
+                .get_resource::<Selection>()
+                .map(|selection| selection.entities.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entity| world.get_entity(*entity).is_ok())
+                .collect();
+            if selected.is_empty() {
+                let mut roots = scene_roots(world);
+                roots.sort();
+                roots
+            } else {
+                selected
+            }
+        }
+    };
+    if targets.is_empty() {
+        return Err(invalid_params(
+            "the scene is empty, so there is nothing to view",
+        ));
+    }
+    Ok(targets)
+}
+
+/// The angles a views request names: names from
+/// [`crate::views::ViewAngle::NAMES`] or `{eye, target}`.
+fn view_angles(params: &Value, per_target: bool) -> BrpResult<Vec<crate::views::ViewAngle>> {
+    use crate::views::ViewAngle;
+    let given = match params.get("angles") {
+        None | Some(Value::Null) => {
+            return Ok(if per_target {
+                vec![ViewAngle::Iso]
+            } else {
+                ViewAngle::DEFAULT.to_vec()
+            });
+        }
+        Some(Value::Array(angles)) if !angles.is_empty() => angles,
+        Some(other) => {
+            return Err(invalid_params(format!(
+                "`angles` is a list of names or {{eye, target}}, not {other}"
+            )));
+        }
+    };
+    given
+        .iter()
+        .map(|angle| match angle {
+            Value::String(name) => ViewAngle::named(name).ok_or_else(|| {
+                invalid_params(format!(
+                    "angle `{name}`: expected one of {} or {{eye, target}}",
+                    ViewAngle::NAMES.join(", ")
+                ))
+            }),
+            Value::Object(_) => {
+                let point = |key: &str| -> BrpResult<Option<Vec3>> {
+                    match angle.get(key).filter(|value| !value.is_null()) {
+                        None => Ok(None),
+                        Some(value) => vec_of(value, 3)
+                            .map(|v| Some(Vec3::new(v[0], v[1], v[2])))
+                            .ok_or_else(|| {
+                                invalid_params(format!("angle `{key}` = {value} is not [x, y, z]"))
+                            }),
+                    }
+                };
+                let eye = point("eye")?
+                    .ok_or_else(|| invalid_params("an `{eye, target}` angle needs an `eye`"))?;
+                let target = point("target")?;
+                if target.is_some_and(|target| target == eye) {
+                    return Err(invalid_params("an angle's eye is its target"));
+                }
+                Ok(ViewAngle::Eye { eye, target })
+            }
+            other => Err(invalid_params(format!(
+                "an angle is a name or {{eye, target}}, not {other}"
+            ))),
+        })
+        .collect()
+}
+
+/// A unit box at `target`'s position, for a target with no bounds of its own.
+fn unit_box(world: &World, target: Entity) -> (Vec3, Vec3) {
+    let at = world
+        .get::<GlobalTransform>(target)
+        .map(GlobalTransform::translation)
+        .or_else(|| world.get::<Transform>(target).map(|t| t.translation))
+        .unwrap_or_default();
+    (at - Vec3::splat(0.5), at + Vec3::splat(0.5))
+}
+
+fn view_name(world: &World, entity: Entity) -> String {
+    world.get::<Name>(entity).map_or_else(
+        || entity.to_bits().to_string(),
+        |name| name.as_str().to_string(),
+    )
+}
+
+/// Write a views request's tiles, as one sheet or a file each, and the answer
+/// naming them.
+fn write_views(
+    tiles: &[ViewTileLabel],
+    layout: Option<crate::views::SheetLayout>,
+    format: crate::screenshot::ThumbnailFormat,
+    path: &Path,
+    images: &[::image::RgbImage],
+    (min, max): (Vec3, Vec3),
+) -> BrpResult<Value> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let bounds = json!([super::summary::vector(min), super::summary::vector(max)]);
+    let tile_entry = |tile: &ViewTileLabel, mut entry: Value| {
+        entry["label"] = json!(tile.label);
+        if let Some(target) = tile.target {
+            entry["entity"] = json!(target.to_bits());
+        }
+        entry
+    };
+    let cannot = |path: &Path, err: ::image::ImageError| {
+        internal_error(format!("cannot write {}: {err}", path.display()))
+    };
+    match layout {
+        Some(layout) => {
+            let sheet = crate::views::compose(layout, images);
+            crate::screenshot::save_rgb(&sheet, path, format).map_err(|err| cannot(path, err))?;
+            let laid: Vec<Value> = tiles
+                .iter()
+                .enumerate()
+                .map(|(index, tile)| {
+                    let (x, y) = layout.origin(index);
+                    tile_entry(tile, json!({ "at": [x, y, layout.tile, layout.tile] }))
+                })
+                .collect();
+            Ok(json!({
+                "path": path,
+                "width": sheet.width(),
+                "height": sheet.height(),
+                "tiles": laid,
+                "bounds": bounds,
+            }))
+        }
+        None => {
+            let mut written = Vec::with_capacity(tiles.len());
+            for (index, (tile, image)) in tiles.iter().zip(images).enumerate() {
+                let stem = path.file_stem().map_or_else(
+                    || "views".to_string(),
+                    |stem| stem.to_string_lossy().into_owned(),
+                );
+                let file = path.with_file_name(format!("{stem}-{index}.{}", format.extension()));
+                crate::screenshot::save_rgb(image, &file, format)
+                    .map_err(|err| cannot(&file, err))?;
+                written.push(tile_entry(
+                    tile,
+                    json!({ "path": file, "width": image.width(), "height": image.height() }),
+                ));
+            }
+            Ok(json!({ "tiles": written, "bounds": bounds }))
+        }
+    }
 }
 
 /// Let frames pass, or wait for the editor to reach a state. `until` takes
@@ -1608,10 +3069,14 @@ fn editor_is_busy(world: &mut World) -> bool {
     let gesturing = world
         .get_resource::<crate::test_input::SyntheticInput>()
         .is_some_and(|input| !input.is_idle());
+    let pacing = world
+        .get_resource::<super::paced::PacedBatches>()
+        .is_some_and(super::paced::PacedBatches::is_playing);
     building
         || placing
         || refining
         || gesturing
+        || pacing
         || world
             .query::<&jackdaw_api_internal::BackgroundTask>()
             .iter(world)
@@ -1669,25 +3134,33 @@ fn current_frame(world: &World) -> u32 {
 
 /// Forget requests nothing has polled for `STALE_FRAMES`.
 fn expire_stale(world: &mut World, frame: u32) {
-    let mut dropped: Vec<PathBuf> = Vec::new();
+    let mut dropped: Vec<(PathBuf, Option<Box<Aim>>)> = Vec::new();
+    let mut abandoned: Vec<Box<ViewsJob>> = Vec::new();
     {
         let mut waits = world.get_resource_or_init::<PendingWaits>();
         waits.requests.retain(|_, pending| {
             if frame.saturating_sub(pending.last_seen) < STALE_FRAMES {
                 return true;
             }
-            if let PendingState::Capture { path } = &pending.state {
-                dropped.push(path.clone());
+            match std::mem::replace(&mut pending.state, PendingState::Answered) {
+                PendingState::Capture { path, aim, .. } => dropped.push((path, aim)),
+                PendingState::Views(job) => abandoned.push(job),
+                _ => {}
             }
             false
         });
     }
+    for job in abandoned {
+        crate::views::finish(world, job.request, job.isolation);
+    }
     // A capture whose client left still lands on disk; its log entry goes with
-    // the request so the next capture to that path is not answered with it.
-    if !dropped.is_empty()
-        && let Some(mut log) = world.get_resource_mut::<crate::screenshot::CaptureLog>()
-    {
-        for path in dropped {
+    // the request so the next capture to that path is not answered with it,
+    // and a camera it aimed goes back if nobody has moved it since.
+    for (path, aim) in dropped {
+        if let Some(aim) = aim {
+            aim.put_back(world);
+        }
+        if let Some(mut log) = world.get_resource_mut::<crate::screenshot::CaptureLog>() {
             log.forget(&path);
         }
     }
@@ -1718,15 +3191,20 @@ struct PendingRequest {
 enum PendingState {
     Capture {
         path: PathBuf,
+        /// Whether the capture is queued yet; an aimed one waits a frame so
+        /// the camera's new place reaches the render.
+        queued: bool,
+        /// The camera the capture aimed.
+        aim: Option<Box<Aim>>,
     },
+    /// Offscreen views waiting for their tiles.
+    Views(Box<ViewsJob>),
+    /// A capture already answered, kept until the HTTP layer stops polling.
+    Answered,
     /// The frame at which the wait is over.
-    Frames {
-        until: u32,
-    },
+    Frames { until: u32 },
     /// The asset walk running on the IO pool.
-    Assets {
-        task: Task<Vec<String>>,
-    },
+    Assets { task: Task<Vec<String>> },
     /// A play-in-editor state being held for.
     Pie(PieWait),
 }
@@ -1752,6 +3230,52 @@ mod tests {
             default: None,
             doc: "",
         }
+    }
+
+    #[test]
+    fn a_reference_names_a_call_and_a_path_into_its_outcome() {
+        assert_eq!(
+            parse_reference("$3.entities.0"),
+            Ok(Some(ResultRef {
+                call: 3,
+                path: vec!["entities", "0"],
+            }))
+        );
+        assert_eq!(parse_reference("plain"), Ok(None));
+        assert_eq!(parse_reference("$name"), Ok(None), "a `$` word is text");
+        for malformed in ["$1", "$1.", "$1..entities", "$1x.entities", "$1.colour"] {
+            assert!(parse_reference(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn a_reference_must_name_an_earlier_call() {
+        let params = json!({ "parent": "$0.entities.0", "list": ["$1.entities.0"] });
+        assert!(check_references(Some(&params), 2).expect("both are earlier"));
+        assert!(check_references(Some(&params), 1).is_err());
+        assert!(!check_references(Some(&json!({ "name": "Cube" })), 0).expect("no references"));
+    }
+
+    #[test]
+    fn a_reference_is_filled_from_the_outcome_it_names() {
+        let earlier = vec![json!({ "id": "entity.add.group", "entities": [42, 43] })];
+        let call = json!({ "id": "entity.add.cube", "params": { "parent": "$0.entities.1" } });
+        let filled = fill_references(&call, &earlier).expect("the value is there");
+        assert_eq!(filled["params"]["parent"], json!(43));
+
+        let missing = json!({ "id": "x", "params": { "parent": "$0.entities.5" } });
+        assert!(fill_references(&missing, &earlier).is_err());
+    }
+
+    #[test]
+    fn a_doubled_dollar_is_text_that_starts_with_one() {
+        assert_eq!(parse_reference("$$100 Prop"), Ok(None));
+        assert!(parse_reference("$100 Prop").is_err());
+        let call = json!({ "id": "x", "params": { "name": "$$1.50", "tags": ["$$x"] } });
+        let filled = fill_references(&call, &[]).expect("no references");
+        assert_eq!(filled["params"]["name"], json!("$1.50"));
+        assert_eq!(filled["params"]["tags"][0], json!("$x"));
+        assert!(!holds_reference(&call["params"]));
     }
 
     /// The declared type decides, not the JSON's.

@@ -29,7 +29,7 @@ use jackdaw_widgets::tree_view::{
 
 use crate::{
     EditorEntity, EditorHidden, OP_PREFIX,
-    commands::{CommandHistory, EditorCommand, ReparentEntity, SetBsnField},
+    commands::{CommandHistory, EditorCommand, ReparentEntity},
     entity_ops,
     layout::HierarchyFilter,
     selection::{Selected, Selection},
@@ -3024,6 +3024,7 @@ impl Command for RestoreLabel {
     label = "Rename Entity",
     description = "Rename the selected entity in the hierarchy.",
     modal = true,
+    allows_undo = false,
     cancel = cancel_rename_begin,
     is_available = no_rename_in_progress,
     params(entity(Entity, doc = "Scene entity to rename.")),
@@ -3179,13 +3180,8 @@ fn handle_inline_rename_commit(
     };
 
     input_focus.clear();
-    commands.queue(RestoreLabel {
-        label_entity,
-        text: event.text.clone(),
-    });
     commands.entity(rename_entity).despawn();
 
-    // Trigger the rename
     commands.trigger(TreeRowRenamed {
         entity: label_entity,
         source_entity,
@@ -3193,39 +3189,24 @@ fn handle_inline_rename_commit(
     });
 }
 
-/// Commit inline rename: update Name with undo.
+/// Commit inline rename through `entity.rename`, then show whatever name the
+/// node ended up with, which is the old one when the operator refused.
 fn on_tree_row_renamed(event: On<TreeRowRenamed>, mut commands: Commands, names: Query<&Name>) {
     let source = event.source_entity;
-    let new_name = event.new_name.clone();
-
-    // Apply name change with undo
-    let old_name = names
-        .get(source)
-        .map(|n| n.as_str().to_string())
-        .unwrap_or_default();
-
-    if old_name == new_name {
-        return;
+    let label_entity = event.entity;
+    if entity_name(&names, source) != event.new_name {
+        commands
+            .operator(crate::remote_ops::EntityRenameOp::ID)
+            .param("entity", source)
+            .param("name", event.new_name.clone())
+            .call();
     }
-
     commands.queue(move |world: &mut World| {
-        let old_value = if old_name.is_empty() {
-            None
-        } else {
-            Some(jackdaw_bsn::BsnValue::String(old_name))
-        };
-        let cmd = SetBsnField {
-            entity: source,
-            type_path: crate::commands::NAME_TYPE_PATH.to_string(),
-            field_path: String::new(),
-            old_value,
-            new_value: jackdaw_bsn::BsnValue::String(new_name),
-            was_derived: false,
-        };
-        let mut cmd = Box::new(cmd);
-        cmd.execute(world);
-        let mut history = world.resource_mut::<CommandHistory>();
-        history.push_executed(cmd);
+        let text = world
+            .get::<Name>(source)
+            .map(|name| name.as_str().to_string())
+            .unwrap_or_default();
+        RestoreLabel { label_entity, text }.apply(world);
     });
 }
 
@@ -3309,6 +3290,7 @@ fn on_prefab_dialog_action(
 /// pending state after running.
 #[operator(
     id = "prefab.save_as_prefab",
+    writes_disk = true,
     label = "Save as Prefab",
     description = "Write the pending entity roots out as a new prefab file.",
     allows_undo = true,
@@ -3355,6 +3337,7 @@ pub fn prefab_save_as_prefab(
 /// that point on.
 #[operator(
     id = "prefab.save_scene_as_prefab",
+    writes_disk = true,
     label = "Save Scene as Prefab",
     description = "Write the active scene tab out as a new prefab file and convert the tab into a prefab tab.",
     allows_undo = true,
@@ -3395,6 +3378,7 @@ pub fn prefab_save_scene_as_prefab(
 /// instance overrides.
 #[operator(
     id = "prefab.save_as_variant",
+    writes_disk = true,
     label = "Save as Variant",
     description = "Write the pending instance out as a variant prefab.",
     allows_undo = true,
@@ -3499,21 +3483,56 @@ pub fn clear_all_tree_rows(
     world.resource_mut::<TreeIndex>().clear();
 }
 
-/// Filter hierarchy tree rows based on the filter text input.
+/// Filter hierarchy tree rows based on the filter text input: a plain word
+/// matches names case-insensitively, while a complete entity reference
+/// (`#roof`, `village/*/roof`, `#roof&under:inn`) shows the nodes it matches.
 fn apply_hierarchy_filter(
     filter_input: Query<&TextEditValue, (With<HierarchyFilter>, Changed<TextEditValue>)>,
-    tree_nodes: Query<(Entity, &TreeNode)>,
-    names: Query<&Name>,
-    parent_query: Query<&ChildOf>,
-    tree_row_children_query: Query<(), With<TreeRowChildren>>,
-    mut display_query: Query<&mut Node>,
-    mut parked_query: Query<&mut jackdaw_widgets::tree_view::TreeRowParked>,
+    mut commands: Commands,
 ) {
     let Ok(text_edit_value) = filter_input.single() else {
         return;
     };
+    let filter = text_edit_value.0.trim().to_string();
+    commands.queue(move |world: &mut World| filter_rows(world, &filter));
+}
 
-    let filter = text_edit_value.0.trim().to_lowercase();
+type FilterRows<'w, 's> = (
+    Query<'w, 's, (Entity, &'static TreeNode)>,
+    Query<'w, 's, &'static Name>,
+    Query<'w, 's, &'static ChildOf>,
+    Query<'w, 's, (), With<TreeRowChildren>>,
+    Query<'w, 's, &'static mut Node>,
+    Query<'w, 's, &'static mut jackdaw_widgets::tree_view::TreeRowParked>,
+);
+
+fn filter_rows(world: &mut World, filter: &str) {
+    // Text still being typed (`#`, `village/`) is not a query yet, so it
+    // searches names until it parses.
+    let is_query = crate::entity_refs::looks_like_query(filter)
+        && crate::entity_refs::Reference::parse(filter).is_ok();
+    let referenced: Option<HashSet<Entity>> = is_query.then(|| {
+        crate::entity_refs::resolve(world, filter)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    });
+    let lowered = filter.to_lowercase();
+    let mut state = bevy::ecs::system::SystemState::<FilterRows>::new(world);
+    let (
+        tree_nodes,
+        names,
+        parent_query,
+        tree_row_children_query,
+        mut display_query,
+        mut parked_query,
+    ) = match state.get_mut(world) {
+        Ok(params) => params,
+        Err(err) => {
+            warn!("hierarchy filter: {err}");
+            return;
+        }
+    };
 
     if filter.is_empty() {
         for (tree_entity, _) in &tree_nodes {
@@ -3531,11 +3550,14 @@ fn apply_hierarchy_filter(
     let mut visible_tree_entities: HashSet<Entity> = HashSet::new();
 
     for (tree_entity, tree_node) in &tree_nodes {
-        let label = names
-            .get(tree_node.0)
-            .map(|n| n.as_str().to_lowercase())
-            .unwrap_or_else(|_| format!("entity {}", tree_node.0).to_lowercase());
-        let matches = label.contains(&filter);
+        let matches = match &referenced {
+            Some(found) => found.contains(&tree_node.0),
+            None => names
+                .get(tree_node.0)
+                .map(|n| n.as_str().to_lowercase())
+                .unwrap_or_else(|_| format!("entity {}", tree_node.0).to_lowercase())
+                .contains(&lowered),
+        };
 
         if matches {
             visible_tree_entities.insert(tree_entity);

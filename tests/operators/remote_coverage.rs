@@ -14,12 +14,14 @@ use crate::util;
 /// Each is listed with the operator that does the same job from parameters, or
 /// with `None` and the reason no such operator exists yet; adding a modal
 /// operator without a row here fails `every_modal_operator_has_a_parametric_answer`.
+/// A modal operator that runs at once when given its parameters is its own
+/// twin.
 const POINTER_ONLY: &[(&str, Option<&str>, &str)] = &[
     (
         "brush.box_select",
-        None,
-        "a rubber band over brush vertices, edges and faces; sub-element selection has no \
-         parametric form yet",
+        Some("brush.select_elements"),
+        "a rubber band over brush vertices, edges and faces; select them by index or rule \
+         instead",
     ),
     (
         "selection.box_select",
@@ -43,8 +45,8 @@ const POINTER_ONLY: &[(&str, Option<&str>, &str)] = &[
     ),
     (
         "hierarchy.rename_begin",
-        Some("component.set"),
-        "an inline text field; set the Name component instead",
+        Some("entity.rename"),
+        "an inline text field; rename by value instead",
     ),
     (
         "tilemap.brush",
@@ -108,44 +110,49 @@ const POINTER_ONLY: &[(&str, Option<&str>, &str)] = &[
         "dragging one face; nudge by a step instead",
     ),
     (
+        "brush.clip.place_point",
+        Some("brush.clip"),
+        "clip points placed on the brush with the cursor; a plane by normal and point instead",
+    ),
+    (
         "tools.measure_distance",
         None,
         "two clicks in the viewport; reading a distance is not authoring",
     ),
     (
         "brush.mesh.extrude",
-        None,
-        "a drag distance; no parametric form yet",
+        Some("brush.mesh.extrude_region"),
+        "a drag distance; extrude the face selection by a `distance` instead",
     ),
     (
         "brush.mesh.inset",
-        None,
-        "a drag distance; no parametric form yet",
+        Some("brush.mesh.inset"),
+        "a drag distance; give `amount` (and `depth`) and it runs at once",
     ),
     (
         "brush.mesh.loop_cut",
-        None,
-        "a hovered edge ring plus a drag; no parametric form yet",
+        Some("brush.mesh.loop_cut_at"),
+        "a hovered edge ring plus a drag; cut across a named edge at its middle instead",
     ),
     (
         "brush.mesh.edge_bevel",
-        None,
-        "a drag width; no parametric form yet",
+        Some("brush.mesh.edge_bevel"),
+        "a drag width; give `width` (and `segments`) and it runs at once",
     ),
     (
         "brush.mesh.vertex_bevel",
-        None,
-        "a drag width; no parametric form yet",
+        Some("brush.mesh.vertex_bevel"),
+        "a drag width; give `width` and it runs at once",
     ),
     (
         "brush.mesh.edge_slide_modal",
-        None,
-        "a drag along the edge; no parametric form yet",
+        Some("brush.mesh.edge_slide"),
+        "a drag along the edge; slide the edge selection by a fraction `t` instead",
     ),
     (
         "brush.mesh.vertex_slide_modal",
-        None,
-        "a drag along the edge; no parametric form yet",
+        Some("brush.mesh.vertex_slide"),
+        "a drag along the edge; slide the vertex selection by a fraction `t` instead",
     ),
 ];
 
@@ -276,6 +283,13 @@ fn the_pointer_only_table_names_operators_that_exist() {
             .iter()
             .find(|op| op.id() == *twin)
             .unwrap_or_else(|| panic!("{id}'s twin `{twin}` is not registered"));
+        if twin == id {
+            assert!(
+                !twin_op.parameters().is_empty(),
+                "{id} is listed as its own twin but takes no parameters to run without a pointer"
+            );
+            continue;
+        }
         assert!(
             !twin_op.is_modal(),
             "{id}'s twin `{twin}` is itself modal, so it needs a pointer too"
@@ -344,6 +358,29 @@ fn the_parametric_authoring_operators_are_registered() {
 
     for (id, wanted) in [
         ("entity.add.group", &["name", "parent"][..]),
+        (
+            "entity.add.cube",
+            &["size", "pos", "rot", "material", "parent", "name"][..],
+        ),
+        (
+            "entity.add.cylinder",
+            &[
+                "size",
+                "segments",
+                "radius_top",
+                "pos",
+                "rot",
+                "material",
+                "parent",
+                "name",
+            ][..],
+        ),
+        (
+            "entity.add.sphere",
+            &["size", "kind", "segments", "rings", "subdivisions", "name"][..],
+        ),
+        ("entity.add.pyramid", &["size", "sides", "name"][..]),
+        ("entity.add.plane", &["size", "name"][..]),
         ("entity.set_transform", &["entity", "x", "yaw", "sx"][..]),
         (
             "component.set",
@@ -358,6 +395,62 @@ fn the_parametric_authoring_operators_are_registered() {
             &["terrain", "x", "z", "radius", "slot", "opacity"][..],
         ),
         ("selection.extend", &["name"][..]),
+        ("brush.mesh.extrude", &["distance"][..]),
+        ("brush.mesh.extrude_region", &["distance"][..]),
+        ("brush.mesh.inset", &["amount", "depth"][..]),
+        ("brush.mesh.edge_bevel", &["width", "segments"][..]),
+        ("brush.mesh.vertex_bevel", &["width"][..]),
+        (
+            "brush.mesh.loop_cut_at",
+            &["edge", "where", "count", "factor"][..],
+        ),
+        ("brush.mesh.subdivide", &["cuts"][..]),
+        ("brush.clip", &["entity", "normal", "point", "keep"][..]),
+        (
+            "mesh.add_brush",
+            &[
+                "outline",
+                "plane",
+                "depth",
+                "taper",
+                "depth_segments",
+                "pos",
+                "rot",
+                "material",
+                "parent",
+                "name",
+            ][..],
+        ),
+        (
+            "mesh.add_revolve",
+            &[
+                "profile",
+                "segments",
+                "angle_deg",
+                "axis",
+                "caps",
+                "pos",
+                "rot",
+                "material",
+                "parent",
+                "name",
+            ][..],
+        ),
+        ("brush.mesh.edge_slide", &["t"][..]),
+        ("brush.mesh.vertex_slide", &["t"][..]),
+        (
+            "brush.elements.transform",
+            &[
+                "translate",
+                "rotate",
+                "scale",
+                "pivot",
+                "point",
+                "space",
+                "falloff_radius",
+                "falloff_curve",
+            ][..],
+        ),
         ("sprite.add", &["path", "x", "y", "parent", "name"][..]),
         ("sprite.set_pixels_per_unit", &["entity", "ppu"][..]),
         ("sprite.set_anchor", &["entity", "preset", "x", "y"][..]),
@@ -433,4 +526,27 @@ fn the_parametric_authoring_operators_are_registered() {
             );
         }
     }
+}
+
+/// A `parent` an add operator takes means "top level" when left out, so
+/// leaving it out must not warn that the call is missing a target.
+#[test]
+fn every_optional_parent_is_listed_as_optional() {
+    let mut app = util::editor_test_app();
+    let unlisted: Vec<&str> = registered(&mut app)
+        .iter()
+        .filter(|op| op.id() != "entity.reparent")
+        .filter(|op| {
+            op.parameters()
+                .iter()
+                .any(|spec| spec.name == "parent" && spec.ty == "Entity")
+        })
+        .filter(|op| !jackdaw::boot_ops::OPTIONAL_ENTITY_PARAMS.contains(&(op.id(), "parent")))
+        .map(OperatorEntity::id)
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "these operators take an optional `parent` but are not in OPTIONAL_ENTITY_PARAMS: \
+         {unlisted:?}"
+    );
 }

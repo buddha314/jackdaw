@@ -1,11 +1,5 @@
 //! The outliner and the entity operations reached from it: reordering, the
 //! clipboard, the palette and the add-entity flows.
-//!
-//! Each module below was its own test binary. Merged, the editor
-//! links once for the theme rather than once per file.
-
-#[path = "../util/mod.rs"]
-mod util;
 
 mod component_picker;
 mod entity_clipboard;
@@ -17,6 +11,7 @@ mod outliner_drag_cleanup;
 mod outliner_keyboard_walk;
 mod outliner_missing_prefab;
 mod outliner_range_select;
+mod outliner_reference_filter;
 mod outliner_rename;
 mod outliner_row_drop;
 mod outliner_row_icons;
