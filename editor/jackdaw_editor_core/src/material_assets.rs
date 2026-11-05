@@ -470,6 +470,12 @@ impl EditedMaterials {
     }
 }
 
+/// Whether no gesture is under way. A drag on a material control changes the
+/// material every frame; its file is written when the button comes up.
+fn no_mouse_button_held(mouse: Option<Res<ButtonInput<MouseButton>>>) -> bool {
+    mouse.is_none_or(|mouse| mouse.get_pressed().next().is_none())
+}
+
 /// Write back every material a panel edited, for the ones with a file behind
 /// them.
 pub fn write_edited_materials(world: &mut World) {
@@ -665,7 +671,9 @@ pub(crate) fn plugin(app: &mut App) {
     .init_resource::<EditedMaterials>()
     .add_systems(
         Update,
-        write_edited_materials.run_if(in_state(crate::AppState::Editor)),
+        write_edited_materials
+            .run_if(in_state(crate::AppState::Editor))
+            .run_if(no_mouse_button_held),
     )
     .add_observer(on_delete_dialog_opened)
     .add_observer(on_delete_dialog_closed)

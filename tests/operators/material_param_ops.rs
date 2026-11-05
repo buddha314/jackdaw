@@ -167,6 +167,64 @@ fn the_fields() -> Value {
     })
 }
 
+/// The game reads a material's file, so a panel's edit has to reach it, once
+/// the mouse that made the edit is released.
+#[test]
+fn a_panel_edit_to_a_created_material_reaches_its_file_on_release() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut app = project_app(tmp.path());
+    changed(&call(
+        &mut app,
+        "material.create",
+        json!({ "name": "moss" }),
+    ));
+    app.update();
+    let file = tmp.path().join("assets/materials/moss.bsn");
+    assert!(
+        !std::fs::read_to_string(&file)
+            .expect("the file")
+            .contains("base_color"),
+        "a new material starts on the default colour"
+    );
+
+    let handle = app
+        .world()
+        .resource::<jackdaw::material_preview::MaterialPreviewState>()
+        .active_material
+        .clone()
+        .expect("creating a material selects it");
+    app.world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .get_mut(&handle)
+        .expect("the material")
+        .base_color = Color::srgb(0.2, 1.0, 0.5);
+    app.world_mut()
+        .get_resource_or_init::<ButtonInput<MouseButton>>()
+        .press(MouseButton::Left);
+    app.world_mut()
+        .resource_mut::<jackdaw::material_assets::EditedMaterials>()
+        .edited(&handle);
+
+    app.update();
+    assert!(
+        !std::fs::read_to_string(&file)
+            .expect("the file")
+            .contains("base_color"),
+        "nothing is written while the button is down"
+    );
+
+    let mut mouse = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
+    mouse.release(MouseButton::Left);
+    mouse.clear();
+    app.update();
+    assert!(
+        std::fs::read_to_string(&file)
+            .expect("the file")
+            .contains("base_color"),
+        "the released edit is in the file"
+    );
+}
+
 #[test]
 fn creating_with_fields_equals_creating_then_setting_them() {
     let tmp = tempfile::tempdir().expect("tempdir");
