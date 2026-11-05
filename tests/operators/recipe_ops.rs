@@ -14,7 +14,7 @@ use crate::util;
 use crate::util::OperatorResultExt as _;
 
 /// An editor with a scene open in a project of its own, and the project.
-fn recipe_project() -> (App, tempfile::TempDir) {
+pub(super) fn recipe_project() -> (App, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
         .prefix("jackdaw-recipes-")
         .tempdir()
@@ -40,9 +40,9 @@ fn open_project(app: &mut App, dir: &tempfile::TempDir) {
 }
 
 /// Write a project recipe and index it, as the project watcher would.
-fn write_recipe(app: &mut App, dir: &tempfile::TempDir, name: &str, body: &str) {
+pub(super) fn write_recipe(app: &mut App, dir: &tempfile::TempDir, name: &str, body: &str) {
     let text = format!(
-        "// jackdaw asset jackdaw::recipes::Recipe\n#{name}\njackdaw::recipes::Recipe {{\n{body}\n}}\n"
+        "// jackdaw asset jackdaw_editor_core::recipes::Recipe\n#{name}\njackdaw_editor_core::recipes::Recipe {{\n{body}\n}}\n"
     );
     std::fs::write(
         dir.path().join(format!("assets/recipes/{name}.recipe.bsn")),
@@ -54,7 +54,7 @@ fn write_recipe(app: &mut App, dir: &tempfile::TempDir, name: &str, body: &str) 
 }
 
 #[track_caller]
-fn call(app: &mut App, id: &str, params: Value) -> Value {
+pub(super) fn call(app: &mut App, id: &str, params: Value) -> Value {
     let answer = app
         .world_mut()
         .run_system_cached_with(
@@ -68,14 +68,14 @@ fn call(app: &mut App, id: &str, params: Value) -> Value {
 }
 
 #[track_caller]
-fn finished(app: &mut App, id: &str, params: Value) -> Value {
+pub(super) fn finished(app: &mut App, id: &str, params: Value) -> Value {
     let answer = call(app, id, params);
     assert_eq!(answer["result"], json!("finished"), "{id}: {answer}");
     answer
 }
 
 #[track_caller]
-fn refused(app: &mut App, id: &str, params: Value) -> String {
+pub(super) fn refused(app: &mut App, id: &str, params: Value) -> String {
     let answer = call(app, id, params);
     assert_eq!(answer["result"], json!("cancelled"), "{id}: {answer}");
     answer["warnings"]
@@ -88,7 +88,7 @@ fn refused(app: &mut App, id: &str, params: Value) -> String {
 }
 
 #[track_caller]
-fn run(app: &mut App, params: Value) -> Entity {
+pub(super) fn run(app: &mut App, params: Value) -> Entity {
     let answer = finished(app, "recipe.run", params);
     let bits = answer["entities"][0].as_u64().expect("the root's id");
     Entity::from_bits(bits)
@@ -104,11 +104,11 @@ fn scene_text(app: &mut App) -> String {
         .to_string()
 }
 
-fn undo_depth(app: &App) -> usize {
+pub(super) fn undo_depth(app: &App) -> usize {
     app.world().resource::<CommandHistory>().undo_stack.len()
 }
 
-fn undo(app: &mut App) {
+pub(super) fn undo(app: &mut App) {
     app.world_mut()
         .operator("history.undo")
         .call()
@@ -128,7 +128,7 @@ fn roots_named(app: &mut App, name: &str) -> Vec<Entity> {
 
 /// The child of `root` named `name`.
 #[track_caller]
-fn child(app: &App, root: Entity, name: &str) -> Entity {
+pub(super) fn child(app: &App, root: Entity, name: &str) -> Entity {
     let found: Vec<Entity> = app
         .world()
         .get::<Children>(root)
@@ -150,7 +150,7 @@ fn child(app: &App, root: Entity, name: &str) -> Entity {
 /// What a root holds, as each child's name, local transform and brush, in
 /// order, so two builds can be compared without their ids. A copy's number,
 /// which counts copies across the whole scene, is left off its name.
-fn contents(app: &App, root: Entity) -> Vec<String> {
+pub(super) fn contents(app: &App, root: Entity) -> Vec<String> {
     let world = app.world();
     world
         .get::<Children>(root)
@@ -180,21 +180,21 @@ fn contents(app: &App, root: Entity) -> Vec<String> {
 const LINE_RECIPE: &str = r#"
     description: "Posts in a row.",
     inputs: [
-        jackdaw::recipes::RecipeInput { name: "count", kind: "int", default: "3", range: [2.0, 10.0] },
-        jackdaw::recipes::RecipeInput { name: "gap", kind: "float", default: "1.5", range: [] },
+        jackdaw_editor_core::recipes::RecipeInput { name: "count", kind: "int", default: "3", range: [2.0, 10.0] },
+        jackdaw_editor_core::recipes::RecipeInput { name: "gap", kind: "float", default: "1.5", range: [] },
     ],
     calls: [
-        jackdaw::recipes::RecipeCall { id: "entity.add.cube", params: map[
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.add.cube", params: map[
             ("name", "Post"),
             ("size", "[0.2, $gap * 0.5, 0.2]"),
             ("pos", "[0, $gap * 0.25, 0]"),
         ] },
-        jackdaw::recipes::RecipeCall { id: "entity.duplicate", params: map[
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.duplicate", params: map[
             ("entity", "$0.entities.0"),
             ("count", "$count - 1"),
             ("offset", "[$gap, 0, 0]"),
         ] },
-        jackdaw::recipes::RecipeCall { id: "entity.tag", params: map[
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.tag", params: map[
             ("entities", "$0.entities.0"),
             ("add", "first"),
         ] },
@@ -294,8 +294,8 @@ fn a_call_that_fails_rolls_the_whole_run_back() {
         r#"
     inputs: [],
     calls: [
-        jackdaw::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Base")] },
-        jackdaw::recipes::RecipeCall { id: "entity.duplicate", params: map[("entity", "$0.entities.4")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Base")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.duplicate", params: map[("entity", "$0.entities.4")] },
     ],"#,
     );
     let text = scene_text(&mut app);
@@ -318,8 +318,8 @@ fn a_recipe_that_writes_to_disk_is_refused_before_it_runs() {
         r#"
     inputs: [],
     calls: [
-        jackdaw::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Base")] },
-        jackdaw::recipes::RecipeCall { id: "scene.save", params: map[("path", "scenes/out.bsn")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Base")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "scene.save", params: map[("path", "scenes/out.bsn")] },
     ],"#,
     );
     let text = scene_text(&mut app);
@@ -601,13 +601,13 @@ fn references_inside_a_recipe_are_held_to_its_root() {
         r#"
     inputs: [],
     calls: [
-        jackdaw::recipes::RecipeCall { id: "entity.add.group", params: map[("name", "Attic")] },
-        jackdaw::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Window"), ("parent", "$0.entities.0")] },
-        jackdaw::recipes::RecipeCall { id: "entity.tag", params: map[("entities", "Attic/Window"), ("add", "glass")] },
-        jackdaw::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Door&Frame"), ("pos", "[2, 0, 0]")] },
-        jackdaw::recipes::RecipeCall { id: "entity.tag", params: map[("entities", "Door&Frame"), ("add", "door")] },
-        jackdaw::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Roof"), ("pos", "[0, 3, 0]")] },
-        jackdaw::recipes::RecipeCall { id: "entity.delete", params: map[("name", "Roof")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.add.group", params: map[("name", "Attic")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Window"), ("parent", "$0.entities.0")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.tag", params: map[("entities", "Attic/Window"), ("add", "glass")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Door&Frame"), ("pos", "[2, 0, 0]")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.tag", params: map[("entities", "Door&Frame"), ("add", "door")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Roof"), ("pos", "[0, 3, 0]")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.delete", params: map[("name", "Roof")] },
     ],"#,
     );
     let root = run(&mut app, json!({ "recipe": "porch" }));
@@ -646,7 +646,7 @@ fn a_recipe_path_outside_the_assets_directory_is_refused() {
     let (mut app, dir) = recipe_project();
     std::fs::write(
         dir.path().join("outside.recipe.bsn"),
-        "// jackdaw asset jackdaw::recipes::Recipe\n#outside\njackdaw::recipes::Recipe { inputs: [], calls: [] }\n",
+        "// jackdaw asset jackdaw_editor_core::recipes::Recipe\n#outside\njackdaw_editor_core::recipes::Recipe { inputs: [], calls: [] }\n",
     )
     .expect("write a file beside the assets");
     let absolute = dir.path().join("outside.recipe.bsn");
@@ -675,7 +675,7 @@ fn a_root_rebuilds_from_the_recipe_it_was_built_from() {
         r#"
     inputs: [],
     calls: [
-        jackdaw::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Impostor")] },
+        jackdaw_editor_core::recipes::RecipeCall { id: "entity.add.cube", params: map[("name", "Impostor")] },
     ],"#,
     );
     let fresh = run(&mut app, json!({ "recipe": "stairs" }));
