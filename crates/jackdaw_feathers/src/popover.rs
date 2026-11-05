@@ -112,16 +112,24 @@ impl PopoverPlacement {
         }
     }
 
-    /// The placement asked for, then its mirror. The widget takes the
-    /// first that fits in the window and the least occluded otherwise.
+    /// The placement asked for, then the other alignments on its side, then the
+    /// same on the mirrored side. The widget takes the first that fits in the
+    /// window and the least occluded otherwise; it never clamps, so without the
+    /// other alignments a popover overflowing along its side stays cut off.
     fn positions(&self) -> Vec<PopoverPosition> {
-        let align = self.align();
+        let aligns = match self.align() {
+            PopoverAlign::Start => [PopoverAlign::Start, PopoverAlign::End, PopoverAlign::Center],
+            PopoverAlign::Center => [PopoverAlign::Center, PopoverAlign::Start, PopoverAlign::End],
+            PopoverAlign::End => [PopoverAlign::End, PopoverAlign::Start, PopoverAlign::Center],
+        };
         [self.side(), self.side().mirror()]
             .into_iter()
-            .map(|side| PopoverPosition {
-                side,
-                align,
-                gap: POPOVER_GAP,
+            .flat_map(|side| {
+                aligns.map(|align| PopoverPosition {
+                    side,
+                    align,
+                    gap: POPOVER_GAP,
+                })
             })
             .collect()
     }
@@ -475,6 +483,38 @@ fn handle_popover_close_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The asked-for placement wins ties; every other alignment on either side
+    /// is on offer, so overflow along the side has somewhere to go.
+    #[test]
+    fn a_placement_offers_every_alignment_on_both_sides() {
+        for (placement, side, align) in [
+            (
+                PopoverPlacement::BottomStart,
+                PopoverSide::Bottom,
+                PopoverAlign::Start,
+            ),
+            (
+                PopoverPlacement::Right,
+                PopoverSide::Right,
+                PopoverAlign::Center,
+            ),
+        ] {
+            let positions = placement.positions();
+            assert_eq!(positions.len(), 6);
+            assert_eq!(positions[0].side, side);
+            assert_eq!(positions[0].align, align);
+            for wanted_side in [side, side.mirror()] {
+                for wanted_align in [PopoverAlign::Start, PopoverAlign::Center, PopoverAlign::End] {
+                    assert!(
+                        positions
+                            .iter()
+                            .any(|p| p.side == wanted_side && p.align == wanted_align)
+                    );
+                }
+            }
+        }
+    }
 
     /// A popover hangs off its anchor from the frame it is spawned, and one
     /// opened at a free position off a point placed there.
