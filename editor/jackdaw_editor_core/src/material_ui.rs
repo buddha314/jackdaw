@@ -696,13 +696,8 @@ pub(crate) fn spawn_color_row(
         crate::inspector::reflect_fields::ColorLabel::Inline(label),
         0.0,
         None,
-        move |world, rgba, _is_final| {
-            if let Some(mut material) = world
-                .resource_mut::<Assets<StandardMaterial>>()
-                .get_mut(&write_handle)
-            {
-                write(&mut material, rgba);
-            }
+        move |world, rgba, is_final| {
+            commit_material_color(world, &write_handle, write, rgba, is_final);
             repaint_color_row_face(world, face, rgba);
         },
     );
@@ -728,6 +723,29 @@ pub(crate) fn spawn_color_row(
         });
 
     field.row
+}
+
+/// Put a colour on the material and, once it settles, queue the material's file
+/// to be rewritten, as the sliders and texture slots do. Without that the edit
+/// lives only in this editor: the game reads the file.
+fn commit_material_color(
+    world: &mut World,
+    handle: &Handle<StandardMaterial>,
+    write: fn(&mut StandardMaterial, [f32; 4]),
+    rgba: [f32; 4],
+    is_final: bool,
+) {
+    if let Some(mut material) = world
+        .resource_mut::<Assets<StandardMaterial>>()
+        .get_mut(handle)
+    {
+        write(&mut material, rgba);
+    }
+    if is_final {
+        world
+            .get_resource_or_init::<crate::material_assets::EditedMaterials>()
+            .edited(handle);
+    }
 }
 
 /// The tab index restored to a gated control when its picker opens again.
@@ -1582,6 +1600,34 @@ mod scalar_commit_tests {
         app.world_mut()
             .resource_mut::<crate::material_assets::EditedMaterials>()
             .clear();
+    }
+
+    #[test]
+    fn a_settled_colour_queues_the_material_for_writing() {
+        let mut app = commit_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let write: fn(&mut StandardMaterial, [f32; 4]) =
+            |material, c| material.base_color = Color::srgba(c[0], c[1], c[2], c[3]);
+
+        commit_material_color(app.world_mut(), &handle, write, [0.2, 1.0, 0.5, 1.0], false);
+        assert!(
+            !is_queued_for_writing(&app),
+            "a colour still being dragged writes nothing"
+        );
+
+        commit_material_color(app.world_mut(), &handle, write, [0.2, 1.0, 0.5, 1.0], true);
+        assert!(is_queued_for_writing(&app), "a settled colour is written");
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&handle)
+                .expect("the material")
+                .base_color,
+            Color::srgba(0.2, 1.0, 0.5, 1.0),
+        );
     }
 
     /// A slider entity carrying the binding a spawned row would have.

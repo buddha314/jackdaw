@@ -1696,6 +1696,33 @@ mod tests {
         assert!(tmp.path().join("assets/materials").is_dir());
     }
 
+    /// The game reads the file, so an edited colour has to be in it.
+    #[test]
+    fn an_edited_base_colour_reaches_the_material_file() {
+        let (mut app, tmp) = project_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        app.world_mut()
+            .resource_mut::<MaterialRegistry>()
+            .add_saved("green".into(), handle.clone());
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&handle)
+            .expect("the material")
+            .base_color = Color::srgb(0.2, 1.0, 0.5);
+
+        edit_and_write(&mut app, &handle);
+
+        let file = std::fs::read_to_string(tmp.path().join("assets/materials/green.bsn"))
+            .expect("the file was written");
+        assert!(
+            file.contains("base_color"),
+            "the colour is in the file:\n{file}"
+        );
+    }
+
     #[test]
     fn unsaved_materials_are_not_written() {
         let (mut app, tmp) = project_app();
