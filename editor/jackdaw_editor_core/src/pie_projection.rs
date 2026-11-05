@@ -41,6 +41,12 @@ const CHILD_OF_PATH: &str = "bevy_ecs::hierarchy::ChildOf";
 /// derives it from the remapped `ChildOf` inserts.
 const CHILDREN_PATH: &str = "bevy_ecs::hierarchy::Children";
 
+/// Type path of the brush component. The game streams its face materials as
+/// nulled handles, so the projector keeps the ones the preview brush wears:
+/// taking them would blank the faces and, through the brush's document sync,
+/// the scene itself.
+const BRUSH_PATH: &str = "jackdaw_scene_types::types::Brush";
+
 /// Component type-path prefixes never applied to preview entities. A streamed
 /// camera would become an ACTIVE render camera in the editor world: the game
 /// rig's camera fights the UI camera at the same order, and a render target
@@ -441,6 +447,17 @@ pub fn apply_component_value(
 
     drop(registry_guard);
 
+    let worn_faces = (type_path == BRUSH_PATH)
+        .then(|| world.get::<jackdaw_scene_types::Brush>(entity))
+        .flatten()
+        .map(|brush| {
+            brush
+                .faces
+                .iter()
+                .map(|face| face.material.clone())
+                .collect::<Vec<_>>()
+        });
+
     let Ok(mut entity_mut) = world.get_entity_mut(entity) else {
         debug!("apply_component_value: entity {entity:?} was despawned concurrently");
         return;
@@ -455,6 +472,14 @@ pub fn apply_component_value(
         );
     } else {
         reflect_component.apply(entity_mut, reflected.as_partial_reflect());
+    }
+
+    if let Some(worn_faces) = worn_faces
+        && let Some(mut brush) = world.get_mut::<jackdaw_scene_types::Brush>(entity)
+    {
+        for (face, worn) in brush.faces.iter_mut().zip(worn_faces) {
+            face.material = worn;
+        }
     }
 }
 
@@ -551,6 +576,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The game streams a brush with every asset handle nulled, since its assets
+    /// mean nothing in this process. Projected onto the authored brush it must
+    /// not take the material off the faces the editor already dressed.
+    #[test]
+    fn an_authored_brush_keeps_its_face_materials_through_projection() {
+        use jackdaw_scene_types::Brush;
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<StandardMaterial>();
+        app.add_plugins(jackdaw_scene_types::SceneTypesPlugin::default());
+
+        let src = app.world_mut().spawn(Brush::cuboid(1.0, 1.0, 1.0)).id();
+        let registry = app.world().resource::<AppTypeRegistry>().clone();
+        let snap = {
+            let reg = registry.read();
+            jackdaw_pie_protocol::build_snapshot(app.world(), &reg, &[src])
+        };
+        let (key, json) = snap[0]
+            .components
+            .iter()
+            .find(|(k, _)| k.ends_with("::Brush"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .expect("Brush serialized into the snapshot");
+
+        let slate = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let mut dressed = Brush::cuboid(1.0, 1.0, 1.0);
+        for face in &mut dressed.faces {
+            face.material = slate.clone();
+        }
+        let authored = app.world_mut().spawn(dressed).id();
+
+        apply_component_value(app.world_mut(), authored, &key, &json);
+
+        let brush = app.world().get::<Brush>(authored).expect("the brush");
+        assert!(
+            brush.faces.iter().all(|face| face.material == slate),
+            "every face still wears the material applied in the editor"
+        );
     }
 
     #[derive(Resource, Default)]

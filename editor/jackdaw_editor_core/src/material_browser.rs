@@ -613,7 +613,10 @@ fn wear_on_meshes(world: &mut World, selected: &[Entity], chosen: WornMaterial) 
     }
     for (root, picked) in models {
         let Some(path) = named.as_deref() else {
-            warn!("material.apply: a placed model keeps only a material saved as an asset file");
+            crate::status_bar::notify_error(
+                world,
+                "Not applied: a placed model takes only a saved material. Save this one first.",
+            );
             continue;
         };
         let names = match world.get::<bevy::gltf::GltfMaterialName>(picked) {
@@ -628,6 +631,12 @@ fn wear_on_meshes(world: &mut World, selected: &[Entity], chosen: WornMaterial) 
         let mut command: Box<dyn EditorCommand> = Box::new(command);
         command.execute(world);
         group.push(command);
+    }
+    if named.is_none() && !targets.is_empty() {
+        crate::status_bar::notify_error(
+            world,
+            "This material has no file, so the scene will not keep it. Save it to keep it.",
+        );
     }
     for entity in targets {
         let Some(command) = crate::inspector::material_row::WearMaterial::new(
