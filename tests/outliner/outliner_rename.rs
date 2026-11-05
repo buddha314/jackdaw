@@ -85,6 +85,41 @@ fn entry_open(app: &mut App) -> bool {
         .is_some()
 }
 
+/// Rename chosen from a row's context menu opens the entry, as F2 does.
+#[test]
+fn rename_from_the_context_menu_opens_the_entry() {
+    use bevy::ecs::world::CommandQueue;
+    use bevy::ui_widgets::Activate;
+    use jackdaw_feathers::context_menu::spawn_context_menu;
+    use jackdaw_widgets::context_menu::ContextMenuState;
+
+    let (mut app, _panel, node) = outliner_app();
+    let mut queue = CommandQueue::default();
+    let mut commands = Commands::new(&mut queue, app.world());
+    let menu = spawn_context_menu(
+        &mut commands,
+        Vec2::new(40.0, 60.0),
+        Some(node),
+        &[("hierarchy.rename", "Rename")],
+    );
+    queue.apply(app.world_mut());
+    {
+        let mut state = app.world_mut().resource_mut::<ContextMenuState>();
+        state.menu_entity = Some(menu);
+        state.target_entity = Some(node);
+    }
+    settle(&mut app);
+    let row = app
+        .world()
+        .get::<Children>(menu)
+        .expect("the menu has a row")[0];
+
+    app.world_mut().trigger(Activate { entity: row });
+    settle(&mut app);
+
+    assert!(entry_open(&mut app), "the menu's Rename opens the entry");
+}
+
 /// F2 renames the primary selection with nothing clicked in the outliner first:
 /// selecting a node is already how a user says which one they mean.
 #[test]
