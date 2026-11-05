@@ -1,0 +1,331 @@
+//! Multi-scene editor state. Owns the tab list; the active tab's
+//! contents live in the live Bevy world, inactive tabs hold a
+//! scene-document snapshot plus the per-tab view state and history.
+
+pub mod confirm_dialog;
+pub mod external_watch;
+pub mod load_progress;
+pub mod operators;
+pub mod swap;
+pub mod ui;
+
+use std::path::PathBuf;
+
+use bevy::prelude::*;
+
+use crate::commands::CommandHistory;
+use crate::project::ProjectRoot;
+use crate::terrain_mode::TerrainDataStore;
+use jackdaw_api_internal::document::{SceneResource, SceneResourceValue};
+
+pub struct ScenesPlugin;
+
+impl Plugin for ScenesPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Scenes>();
+        load_progress::plugin(app);
+        app.init_resource::<confirm_dialog::PendingTabClose>();
+        app.init_resource::<confirm_dialog::PendingQuit>();
+        app.add_systems(
+            Update,
+            (
+                mark_active_dirty_on_history_growth,
+                persist_tabs_to_project_config,
+                ui::rebuild_scene_tab_strip,
+                ui::update_scene_tab_visuals,
+                ui::update_scene_tab_label_abbreviation,
+                ui::show_scene_tab_close_on_hover,
+                intercept_window_close,
+            ),
+        );
+        app.add_observer(ui::on_scene_tab_context_action);
+        app.add_plugins(external_watch::ExternalSceneWatchPlugin);
+    }
+}
+
+/// Intercept `WindowCloseRequested`. If any tab is dirty, show the
+/// confirm-quit dialog and consume the event. Otherwise emit `AppExit::Success`
+/// so the normal X-click flow still works.
+pub fn intercept_window_close(
+    mut close_events: bevy::ecs::message::MessageReader<bevy::window::WindowCloseRequested>,
+    mut exit: bevy::ecs::message::MessageWriter<bevy::app::AppExit>,
+    scenes: Res<Scenes>,
+    mut commands: Commands,
+    mut pending: ResMut<confirm_dialog::PendingQuit>,
+) {
+    let mut close_requested = false;
+    for _ in close_events.read() {
+        close_requested = true;
+    }
+    if !close_requested {
+        return;
+    }
+
+    let any_dirty = scenes.tabs.iter().any(|t| t.dirty);
+    if !any_dirty {
+        exit.write(bevy::app::AppExit::Success);
+        return;
+    }
+
+    // Dialog already open; ignore the repeated event.
+    if pending.active {
+        return;
+    }
+    pending.active = true;
+    pending.leaving_project = false;
+
+    commands.queue(|world: &mut World| {
+        confirm_dialog::spawn_confirm_quit_dialog(world);
+    });
+}
+
+#[derive(Resource, Default)]
+pub struct Scenes {
+    pub tabs: Vec<SceneTab>,
+    pub active: usize,
+}
+
+impl Scenes {
+    /// Append a tab and return its index. Does not activate it.
+    pub fn push_tab(&mut self, tab: SceneTab) -> usize {
+        let idx = self.tabs.len();
+        self.tabs.push(tab);
+        idx
+    }
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub enum TabKind {
+    #[default]
+    Scene,
+    Prefab,
+}
+
+/// What a tab holds when it isn't the active tab.
+///
+/// `Scene` owns its AST directly. `Prefab` keys into `PrefabAstCache`
+/// instead, so the cache stays the single source of truth for prefab
+/// content and a prefab tab can't drift from the cache entry.
+pub enum TabContent {
+    /// Scene document. `None` is the just-pushed / never-captured state
+    /// for an untitled tab; `Some` is what `capture_active_tab` stores
+    /// during a swap. Boxed: the document holds a whole ECS world, so the
+    /// variant would otherwise dwarf `Prefab` (a path).
+    Scene(Option<Box<jackdaw_bsn::SceneBsnAst>>),
+    /// Prefab document. The AST lives in `PrefabAstCache`, keyed by
+    /// this canonical path. Capturing flushes the live scene document
+    /// into the cache entry; activating installs the cache entry back
+    /// into the live world.
+    Prefab(crate::prefab::CanonicalPrefabPath),
+}
+
+impl Default for TabContent {
+    fn default() -> Self {
+        Self::Scene(None)
+    }
+}
+
+pub struct SceneTab {
+    pub path: Option<PathBuf>,
+    pub display_name: String,
+    pub dirty: bool,
+    pub kind: TabKind,
+    pub content: TabContent,
+    pub view_state: ViewState,
+    pub history: CommandHistory,
+    /// Decoded terrain sidecars owned by this tab while it is inactive.
+    /// The active tab's store lives in the world as a resource instead.
+    pub terrain_data_store: TerrainDataStore,
+    /// Extensions' [`SceneResource`] values owned by this tab while it is
+    /// inactive, like the terrain data.
+    pub scene_resources: TabResources,
+    /// Recorded `CommandHistory.undo_stack.len()` as of the last time
+    /// the dirty-tracking system ran (or the tab was activated, or
+    /// saved). If the live history is deeper than this, the user has
+    /// made a change since the last check, and the tab is marked
+    /// `dirty`.
+    pub history_depth_at_last_check: usize,
+    /// Why the tab is in front without its contents in the world, if it is.
+    /// Set, the world is not the file's contents and must not be written back.
+    pub refusal: Option<TabRefusal>,
+}
+
+/// Why an activation refused to put a tab's document in the world. The next
+/// successful activation clears it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TabRefusal {
+    /// The document names vocabulary this build will not spawn.
+    Rejected(String),
+    /// The spawn was attempted and failed.
+    SpawnFailed(String),
+}
+
+impl TabRefusal {
+    /// The message shown for a save this refusal blocks.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Rejected(reason) | Self::SpawnFailed(reason) => reason,
+        }
+    }
+}
+
+impl SceneTab {
+    /// Whether writing this tab's file would write a world that never held it.
+    pub fn is_refused(&self) -> bool {
+        self.refusal.is_some()
+    }
+
+    pub fn new_untitled(n: u32) -> Self {
+        Self {
+            path: None,
+            display_name: format!("untitled-{n}"),
+            dirty: false,
+            kind: TabKind::Scene,
+            content: TabContent::default(),
+            view_state: ViewState::with_default_camera(),
+            history: CommandHistory::default(),
+            terrain_data_store: TerrainDataStore::default(),
+            scene_resources: TabResources::default(),
+            history_depth_at_last_check: 0,
+            refusal: None,
+        }
+    }
+}
+
+/// Extensions' [`SceneResource`] values, keyed by resource type.
+pub type TabResources = std::collections::HashMap<std::any::TypeId, SceneResourceValue>;
+
+fn scene_resources(world: &mut World) -> Vec<SceneResource> {
+    world
+        .query::<&SceneResource>()
+        .iter(world)
+        .copied()
+        .collect()
+}
+
+/// Take every extension's [`SceneResource`] out of the world, for the tab
+/// going inactive.
+pub(crate) fn take_scene_resources(world: &mut World) -> TabResources {
+    scene_resources(world)
+        .into_iter()
+        .filter_map(|resource| Some((resource.type_id(), resource.take(world)?)))
+        .collect()
+}
+
+/// Put back the values a tab took with it, and the default for any it has
+/// none of.
+pub(crate) fn restore_scene_resources(world: &mut World, mut values: TabResources) {
+    for resource in scene_resources(world) {
+        let value = values.remove(&resource.type_id());
+        resource.restore(world, value);
+    }
+}
+
+/// Reset every extension's [`SceneResource`], for a scene leaving the world
+/// with nowhere to keep it.
+pub(crate) fn reset_scene_resources(world: &mut World) {
+    restore_scene_resources(world, TabResources::default());
+}
+
+/// When `Scenes` mutates, mirror the open-tab paths into the project
+/// config so they survive across sessions. Skipped if no project root
+/// is loaded (e.g. project-selector screen, headless tests).
+pub fn persist_tabs_to_project_config(
+    scenes: Res<Scenes>,
+    project_root: Option<ResMut<ProjectRoot>>,
+) {
+    if !scenes.is_changed() {
+        return;
+    }
+    let Some(mut project_root) = project_root else {
+        return;
+    };
+
+    let last_open_tabs: Vec<String> = scenes
+        .tabs
+        .iter()
+        .filter_map(|t| t.path.as_ref())
+        .filter_map(|p| project_root.to_relative(p).to_str().map(str::to_owned))
+        .collect();
+    let last_active_tab = scenes.active;
+
+    let cfg = &mut project_root.config;
+    if cfg.last_open_tabs == last_open_tabs && cfg.last_active_tab == last_active_tab {
+        return;
+    }
+    cfg.last_open_tabs = last_open_tabs;
+    cfg.last_active_tab = last_active_tab;
+
+    let root = project_root.root.clone();
+    let project = project_root.config.clone();
+    if let Err(e) = crate::project::save_project_config(&root, &project) {
+        warn!("Failed to persist tab list to project.jsn: {e}");
+    }
+}
+
+/// Per-frame system: compare the active tab's recorded history depth
+/// with the live `CommandHistory`. Any growth means the user did
+/// something; mark the tab dirty. Shrinkage (undo) is ignored. Save
+/// resets the recorded depth.
+pub fn mark_active_dirty_on_history_growth(
+    history: Res<CommandHistory>,
+    mut scenes: ResMut<Scenes>,
+) {
+    if scenes.tabs.is_empty() {
+        return;
+    }
+    let active = scenes.active;
+    let current_depth = history.undo_stack.len();
+    let tab = scenes.bypass_change_detection().tabs.get_mut(active);
+    let Some(tab) = tab else { return };
+    let recorded = tab.history_depth_at_last_check;
+    let needs_dirty_flip = current_depth > recorded && !tab.dirty;
+    let needs_depth_update = current_depth != recorded;
+    if !needs_dirty_flip && !needs_depth_update {
+        return;
+    }
+    scenes.set_changed();
+    let tab = &mut scenes.tabs[active];
+    if needs_dirty_flip {
+        tab.dirty = true;
+    }
+    tab.history_depth_at_last_check = current_depth;
+}
+
+#[derive(Default, Clone)]
+pub struct ViewState {
+    pub camera_transform: Transform,
+    /// Optional projection matrix. `None` means use the editor's default
+    /// perspective on restore. Stored as a `Mat4` so we don't have to
+    /// reflect the entire `Projection` enum across tab swaps.
+    pub camera_projection: Option<bevy::math::Mat4>,
+    pub edit_mode: crate::brush::EditMode,
+    /// Object-level selection stored as scene node ids so it survives
+    /// the despawn / respawn cycle of a tab swap.
+    pub selection: Vec<jackdaw_scene_types::SceneNodeId>,
+    /// Brush sub-element selection (verts, edges, faces) for whichever
+    /// brush is active in `selection`.
+    pub brush_sub_selection: crate::brush::BrushSelection,
+    /// How the 2D viewport was framed while this tab was active. `None` means
+    /// no framing was ever chosen, so the tab takes whatever its next
+    /// activation gives it.
+    pub ui_view: Option<crate::viewport_2d::Ui2dView>,
+    /// The viewport mode the user picked for this tab, overriding the one its
+    /// scene kind asks for. `None` falls back to the document's kind.
+    pub viewport_mode: Option<crate::viewport_host::ViewportMode>,
+}
+
+impl ViewState {
+    /// Default `ViewState` for a freshly-created tab. Uses the same
+    /// initial camera framing as the viewport setup (looking at the
+    /// origin from `(0, 4, 8)`), so a new untitled scene shows the
+    /// grid + axes instead of the camera sitting on the origin and
+    /// rendering the grid edge-on.
+    pub fn with_default_camera() -> Self {
+        Self {
+            camera_transform: Transform::from_xyz(0.0, 4.0, 8.0)
+                .looking_at(bevy::math::Vec3::ZERO, bevy::math::Vec3::Y),
+            ..Self::default()
+        }
+    }
+}

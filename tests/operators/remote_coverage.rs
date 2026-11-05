@@ -345,7 +345,7 @@ fn every_parameter_type_can_be_written_as_text() {
     assert!(
         unspellable.is_empty(),
         "these parameters have a type no text client can spell. Give the type a spelling in \
-         `text_for` here and in `property_from_json` (src/remote/server.rs): {unspellable:?}"
+         `text_for` here and in `property_from_json` (editor/jackdaw_editor_core/src/operator_calls/mod.rs): {unspellable:?}"
     );
 }
 
@@ -509,6 +509,20 @@ fn the_parametric_authoring_operators_are_registered() {
             "tilemap.write_region",
             &["entity", "layer", "x0", "y0", "text", "mode"][..],
         ),
+        (
+            "recipe.run",
+            &["recipe", "inputs", "pos", "rot", "parent", "name", "seed"][..],
+        ),
+        ("recipe.rerun", &["entity", "inputs", "seed"][..]),
+        ("recipe.record.start", &[][..]),
+        ("recipe.record.stop", &["name", "discard"][..]),
+        (
+            "recipe.promote",
+            &[
+                "entity", "step", "param", "input", "kind", "default", "min", "max",
+            ][..],
+        ),
+        ("recipe.picker", &[][..]),
     ] {
         let op = all
             .iter()

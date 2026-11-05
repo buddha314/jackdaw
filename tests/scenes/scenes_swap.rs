@@ -171,7 +171,7 @@ fn swap_preserves_a_sculpted_terrain() {
     use bevy::render::RenderPlugin;
     use bevy::render::settings::{RenderCreation, WgpuSettings};
     use bevy::winit::WinitPlugin;
-    use jackdaw::terrain::TerrainDataStore;
+    use jackdaw::terrain_mode::TerrainDataStore;
     use jackdaw_scene_types::Terrain;
     use jackdaw_terrain::{RegionTerrainData, TerrainData};
 
@@ -274,7 +274,7 @@ fn scene_tabs_keep_same_named_terrain_sidecars_isolated() {
     use bevy::render::RenderPlugin;
     use bevy::render::settings::{RenderCreation, WgpuSettings};
     use bevy::winit::WinitPlugin;
-    use jackdaw::terrain::TerrainDataStore;
+    use jackdaw::terrain_mode::TerrainDataStore;
     use jackdaw_scene_types::Terrain;
     use jackdaw_terrain::{TerrainData, sidecar};
 
@@ -299,6 +299,7 @@ fn scene_tabs_keep_same_named_terrain_sidecars_isolated() {
     app.init_resource::<jackdaw::selection::Selection>();
     app.init_resource::<jackdaw::scene_io::SceneFilePath>();
     app.init_resource::<TerrainDataStore>();
+    jackdaw_editor_terrain::sidecar_io::plugin(&mut app);
 
     let terrain_entity = app
         .world_mut()
@@ -658,7 +659,7 @@ fn scene_save_all_reports_failure_and_keeps_a_tab_dirty() {
         scenes.tabs[0].dirty = true;
     }
     let data_path = "zone.terrain-0.jdterrain";
-    let mut store = jackdaw::terrain::TerrainDataStore::default();
+    let mut store = jackdaw::terrain_mode::TerrainDataStore::default();
     store.insert(
         data_path.to_string(),
         jackdaw_terrain::RegionTerrainData::from_legacy_v1(&jackdaw_terrain::TerrainData {
@@ -964,7 +965,7 @@ fn swap_does_not_keep_a_jsn_scene_snapshot_field() {
         content: TabContent::Scene(None),
         view_state: jackdaw::scenes::ViewState::default(),
         history: jackdaw::commands::CommandHistory::default(),
-        terrain_data_store: jackdaw::terrain::TerrainDataStore::default(),
+        terrain_data_store: jackdaw::terrain_mode::TerrainDataStore::default(),
         scene_resources: Default::default(),
         history_depth_at_last_check: 0,
         refusal: None,
@@ -2283,10 +2284,11 @@ const TILEMAP_TYPE_PATH: &str = "jackdaw_scene_types::tilemap::Tilemap";
 
 fn tilemap_app(tabs: usize) -> bevy::app::App {
     let mut app = make_app_with_n_tabs(tabs);
-    app.init_resource::<jackdaw::terrain::TerrainDataStore>();
+    app.init_resource::<jackdaw::terrain_mode::TerrainDataStore>();
     app.init_resource::<jackdaw::status_bar::StatusNotice>();
     app.init_resource::<jackdaw::entity_ops::EntityClipboard>();
-    jackdaw::tilemap::plugin(&mut app);
+    jackdaw_editor_tile::tilemap::plugin(&mut app);
+    jackdaw_editor_terrain::sidecar_io::plugin(&mut app);
     app
 }
 
@@ -2362,7 +2364,7 @@ fn named(app: &mut bevy::app::App, name: &str) -> bevy::prelude::Entity {
 
 fn key_of(app: &mut bevy::app::App, name: &str) -> String {
     let entity = named(app, name);
-    jackdaw::tilemap::store_key_of(app.world_mut(), entity).expect("a valid data path")
+    jackdaw_editor_tile::tilemap::store_key_of(app.world_mut(), entity).expect("a valid data path")
 }
 
 fn data_path_of(app: &mut bevy::app::App, name: &str) -> String {
@@ -2378,14 +2380,14 @@ fn data_path_of(app: &mut bevy::app::App, name: &str) -> String {
 fn put_map(app: &mut bevy::app::App, name: &str, data: jackdaw_tilemap::TilemapData) {
     let key = key_of(app, name);
     app.world_mut()
-        .resource_mut::<jackdaw::tilemap::TilemapDataStore>()
+        .resource_mut::<jackdaw_editor_tile::tilemap::TilemapDataStore>()
         .insert(key, data);
 }
 
 fn stored(app: &mut bevy::app::App, name: &str) -> Option<jackdaw_tilemap::TilemapData> {
     let key = key_of(app, name);
     app.world()
-        .resource::<jackdaw::tilemap::TilemapDataStore>()
+        .resource::<jackdaw_editor_tile::tilemap::TilemapDataStore>()
         .get(&key)
         .cloned()
 }
@@ -2393,14 +2395,14 @@ fn stored(app: &mut bevy::app::App, name: &str) -> Option<jackdaw_tilemap::Tilem
 fn quarantined(app: &mut bevy::app::App, name: &str) -> bool {
     let key = key_of(app, name);
     app.world()
-        .resource::<jackdaw::tilemap::TilemapDataStore>()
+        .resource::<jackdaw_editor_tile::tilemap::TilemapDataStore>()
         .load_failed_reason(&key)
         .is_some()
 }
 
 fn ensure(app: &mut bevy::app::App) {
     app.world_mut()
-        .run_system_cached(jackdaw::tilemap::ensure_tilemap_data_path)
+        .run_system_cached(jackdaw_editor_tile::tilemap::ensure_tilemap_data_path)
         .expect("ensure runs");
 }
 
@@ -2476,7 +2478,7 @@ fn scene_save_all_writes_terrain_and_tile_sidecars_of_every_tab() {
     open_new_scene(&mut app, &tmp.path().join("a.bsn"));
     let terrain_path = "a.terrain-0.jdterrain";
     app.world_mut()
-        .resource_mut::<jackdaw::terrain::TerrainDataStore>()
+        .resource_mut::<jackdaw::terrain_mode::TerrainDataStore>()
         .insert(
             terrain_path.to_string(),
             jackdaw_terrain::RegionTerrainData::from_legacy_v1(&jackdaw_terrain::TerrainData {
@@ -2707,7 +2709,7 @@ fn saving_leaves_an_unchanged_tile_sidecar_alone() {
 
     let key = key_of(&mut app, "map");
     app.world_mut()
-        .resource_mut::<jackdaw::tilemap::TilemapDataStore>()
+        .resource_mut::<jackdaw_editor_tile::tilemap::TilemapDataStore>()
         .get_mut(&key)
         .expect("loaded")
         .layers
@@ -2754,8 +2756,11 @@ fn added_duplicated_and_pasted_maps_get_paths_of_their_own() {
         "the original keeps its path"
     );
     for entity in tilemap_entities(&mut app) {
-        let key = jackdaw::tilemap::store_key_of(app.world_mut(), entity).expect("a key");
-        let store = app.world().resource::<jackdaw::tilemap::TilemapDataStore>();
+        let key =
+            jackdaw_editor_tile::tilemap::store_key_of(app.world_mut(), entity).expect("a key");
+        let store = app
+            .world()
+            .resource::<jackdaw_editor_tile::tilemap::TilemapDataStore>();
         assert_eq!(store.get(&key), Some(&painted), "{key} holds the cells");
     }
     let ast = app.world().resource::<jackdaw_bsn::SceneBsnAst>();
@@ -2808,7 +2813,7 @@ fn save_as_gives_the_new_scene_its_own_tile_sidecar() {
     reopen(&mut app, &forest);
     let key = key_of(&mut app, "map");
     *app.world_mut()
-        .resource_mut::<jackdaw::tilemap::TilemapDataStore>()
+        .resource_mut::<jackdaw_editor_tile::tilemap::TilemapDataStore>()
         .get_mut(&key)
         .expect("loaded") = painted_map(6, 2);
     bind(&mut app, 0, &forest2);
@@ -2998,7 +3003,9 @@ fn a_failed_save_as_changes_nothing() {
     assert_eq!(data_path_of(&mut app, "map"), "forest.tilemap-0.jdtiles");
     assert_eq!(key_of(&mut app, "map"), key);
     assert_eq!(stored(&mut app, "map"), Some(painted_map(4, 1)));
-    let store = app.world().resource::<jackdaw::tilemap::TilemapDataStore>();
+    let store = app
+        .world()
+        .resource::<jackdaw_editor_tile::tilemap::TilemapDataStore>();
     assert_eq!(
         store.owner(&key).map(String::from),
         Some(key_of_scene(&forest))
