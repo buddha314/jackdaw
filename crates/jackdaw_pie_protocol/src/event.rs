@@ -30,6 +30,42 @@ pub enum StateEvent {
         grabbed: bool,
         visible: bool,
     },
+    /// A scene root needs to spawn the scene at `path`, relative to the asset
+    /// folder. The editor replies with [`ControlEvent::SceneDocument`] carrying
+    /// the same `request`.
+    RequestScene {
+        request: u64,
+        path: String,
+    },
+    /// No answer to a [`StateEvent::RequestScene`] came in time, so the game
+    /// loaded the scene's file instead of the editor's document.
+    SceneRequestAbandoned {
+        path: String,
+    },
+    /// The game declined a frame stream because it opened its own window.
+    OwnWindow,
+}
+
+/// What the game spawns a requested scene from.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum SceneAnswer {
+    /// The editor's current document. `dir` is the folder it counts as being
+    /// in, relative to the asset folder, and `stem` the name it goes by.
+    /// `sidecars` is the private folder of this scene's unsaved sidecars when any
+    /// exist, laid out like the asset folder; a sidecar found there wins over its
+    /// file.
+    Document {
+        text: String,
+        dir: String,
+        stem: String,
+        sidecars: Option<String>,
+    },
+    /// Load this file, relative to the asset folder. `sidecars` is as for
+    /// [`Self::Document`]: a prefab the file instances can have unsaved sidecars.
+    UseFile {
+        path: String,
+        sidecars: Option<String>,
+    },
 }
 
 /// Editor-to-game messages.
@@ -84,6 +120,29 @@ pub enum ControlEvent {
         node: u64,
         set: Vec<(String, serde_json::Value)>,
         removed: Vec<String>,
+    },
+    /// The reply to a [`StateEvent::RequestScene`].
+    SceneDocument {
+        request: u64,
+        answer: SceneAnswer,
+    },
+    /// Named asset definitions, as the roots a served document embeds them with.
+    /// Sent ahead of an edit naming an asset this game has not been given.
+    SceneAssets {
+        text: String,
+    },
+    /// Asset files the game may not hold as the editor does, as `(path, text)`,
+    /// each text holding the file's one asset root. Sent ahead of anything naming
+    /// the path, and when the asset changes.
+    AssetFiles {
+        files: Vec<(String, String)>,
+    },
+    /// Prefab documents with unsaved changes, as `(path, text)` with `path`
+    /// relative to the asset folder. Sent ahead of the answer that needs them. The
+    /// game reads `text` in place of the file, and `None` sends it back to the
+    /// file.
+    PrefabFiles {
+        files: Vec<(String, Option<String>)>,
     },
 }
 
@@ -171,6 +230,54 @@ mod tests {
                 ),
             ],
             removed: vec!["game::Health".to_string()],
+        };
+        let bytes = to_bytes(&ev).unwrap();
+        assert_eq!(from_bytes::<ControlEvent>(&bytes).unwrap(), ev);
+    }
+
+    #[test]
+    fn a_scene_request_and_its_answers_round_trip() {
+        let ev = StateEvent::RequestScene {
+            request: 3,
+            path: "levels/boss#2.bsn".to_string(),
+        };
+        let bytes = to_bytes(&ev).unwrap();
+        assert_eq!(from_bytes::<StateEvent>(&bytes).unwrap(), ev);
+
+        for answer in [
+            SceneAnswer::Document {
+                text: "#Zone\n".to_string(),
+                dir: "levels".to_string(),
+                stem: "zone".to_string(),
+                sidecars: Some("/game/.jackdaw/play".to_string()),
+            },
+            SceneAnswer::UseFile {
+                path: "scene.bsn".to_string(),
+                sidecars: Some("/game/.jackdaw/play/0".to_string()),
+            },
+        ] {
+            let ev = ControlEvent::SceneDocument { request: 3, answer };
+            let bytes = to_bytes(&ev).unwrap();
+            assert_eq!(from_bytes::<ControlEvent>(&bytes).unwrap(), ev);
+        }
+    }
+
+    #[test]
+    fn scene_assets_round_trip() {
+        let ev = ControlEvent::SceneAssets {
+            text: "#Stone\ngame::Swatch\n".to_string(),
+        };
+        let bytes = to_bytes(&ev).unwrap();
+        assert_eq!(from_bytes::<ControlEvent>(&bytes).unwrap(), ev);
+    }
+
+    #[test]
+    fn prefab_files_round_trip() {
+        let ev = ControlEvent::PrefabFiles {
+            files: vec![
+                ("props/door.bsn".to_string(), Some("#Door\n".to_string())),
+                ("props/gate.bsn".to_string(), None),
+            ],
         };
         let bytes = to_bytes(&ev).unwrap();
         assert_eq!(from_bytes::<ControlEvent>(&bytes).unwrap(), ev);

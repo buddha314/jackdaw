@@ -119,7 +119,10 @@ pub mod perf_probe;
 pub mod pie;
 pub mod pie_menu;
 pub mod pie_mirror;
+mod pie_outbox;
 pub mod pie_projection;
+pub mod play_overlay;
+pub mod play_scene;
 pub mod play_settings;
 pub mod play_sync;
 pub mod prefab;
@@ -821,8 +824,9 @@ fn auto_hide_internal_entities(
                 continue;
             }
 
+            // Something later this frame may despawn a transient entity.
             if let Ok(mut ec) = commands.get_entity(entity) {
-                ec.insert(EditorHidden);
+                ec.try_insert(EditorHidden);
             }
         }
     }
@@ -1654,6 +1658,7 @@ fn cleanup_editor(world: &mut World) {
     scene_io::hooks::forget_project(world);
     scenes::reset_scene_resources(world);
     world.insert_resource(brush::BrushSelection::default());
+    project_build::forget_project_types(world);
 
     // 6. Remove project root
     world.remove_resource::<project::ProjectRoot>();

@@ -89,9 +89,9 @@ fn vec3_value(x: f32, y: f32, z: f32) -> BsnValue {
     BsnValue::Struct(BsnStructData {
         type_path: "glam::Vec3".to_string(),
         fields: BsnStructFields(vec![
-            field("x", BsnValue::Float(f64::from(x))),
-            field("y", BsnValue::Float(f64::from(y))),
-            field("z", BsnValue::Float(f64::from(z))),
+            field("x", BsnValue::from_f32(x)),
+            field("y", BsnValue::from_f32(y)),
+            field("z", BsnValue::from_f32(z)),
         ]),
     })
 }
@@ -109,10 +109,10 @@ fn quat_value(x: f32, y: f32, z: f32, w: f32) -> BsnValue {
     BsnValue::Struct(BsnStructData {
         type_path: "glam::Quat".to_string(),
         fields: BsnStructFields(vec![
-            field("x", BsnValue::Float(f64::from(x))),
-            field("y", BsnValue::Float(f64::from(y))),
-            field("z", BsnValue::Float(f64::from(z))),
-            field("w", BsnValue::Float(f64::from(w))),
+            field("x", BsnValue::from_f32(x)),
+            field("y", BsnValue::from_f32(y)),
+            field("z", BsnValue::from_f32(z)),
+            field("w", BsnValue::from_f32(w)),
         ]),
     })
 }
@@ -176,9 +176,9 @@ fn shift_bsn_translation(value: &mut BsnValue, offset: Vec3) {
     };
     for (axis, delta) in [("x", offset.x), ("y", offset.y), ("z", offset.z)] {
         if let Some(comp) = vec3.fields.0.iter_mut().find(|f| f.name == axis)
-            && let BsnValue::Float(current) = &mut comp.value
+            && let BsnValue::Float(current) = comp.value
         {
-            *current += f64::from(delta);
+            comp.value = BsnValue::from_f32(current as f32 + delta);
         }
     }
 }
@@ -500,9 +500,9 @@ fn write_prefab_from_roots(
         }
     }
 
-    // The copied patches hold what the live document holds, and for a handle
-    // (a brush face's material) that is the asset-blind placeholder its ECS
-    // mirror stored. Name the assets from the live values, as a save does.
+    // The copied patches hold what the live document holds, which has no name
+    // for an asset held only in memory. Name the assets from the live values,
+    // as a save does.
     for (&entity, &node) in &ecs_to_prefab {
         prefab.link(entity, node);
     }
@@ -1514,7 +1514,8 @@ fn resolve_prefab_value(
     };
     let prefab = expanded_prefab_source(world, &source)?;
     let prefab_node = prefab.find_node_by_component_int(PREFAB_ENTITY_ID_TYPE, u64::from(peid))?;
-    get_bsn_field(&prefab, prefab_node, type_path, field_path)
+    let registry = world.resource::<AppTypeRegistry>().read();
+    jackdaw_bsn::held_bsn_field(&prefab, prefab_node, type_path, field_path, &registry)
 }
 
 /// Revert one component field on a prefab-instance entity to its inherited
@@ -2008,6 +2009,23 @@ pub fn apply_all_overrides_to_source(world: &mut World, instance_root_node: Enti
     }
 }
 
+/// A prefab document as text for the file at `path`. A prefab that instances
+/// another names it under the assets folder, as a scene does. Rewritten on a
+/// copy, so `ast` keeps absolute paths.
+pub(crate) fn prefab_body(
+    world: &World,
+    ast: &jackdaw_bsn::SceneBsnAst,
+    path: &Path,
+) -> Result<String, jackdaw_bsn::UnparsableEmit> {
+    let mut out = crate::prefab::resolver_bsn::clone_scene(ast);
+    crate::prefab::save_load::relativize_for_file(
+        world,
+        &mut out,
+        path.parent().unwrap_or(Path::new(".")),
+    );
+    jackdaw_bsn::emit_scene_checked(&out)
+}
+
 /// Write a prefab's cached document to disk and record the saved fingerprint so
 /// the file watcher ignores its own echo.
 pub fn save_prefab_to_disk(world: &mut World, prefab_path: &Path) -> std::io::Result<()> {
@@ -2022,16 +2040,7 @@ pub fn save_prefab_to_disk(world: &mut World, prefab_path: &Path) -> std::io::Re
                 format!("prefab not cached: {}", prefab_path.display()),
             ));
         };
-        // A prefab that instances another names it under the assets folder, as
-        // a scene does. Rewritten on the copy being written, so the cached
-        // document keeps absolute paths.
-        let mut out = crate::prefab::resolver_bsn::clone_scene(ast);
-        crate::prefab::save_load::relativize_for_file(
-            world,
-            &mut out,
-            write_path.parent().unwrap_or(Path::new(".")),
-        );
-        let body = jackdaw_bsn::emit_scene_checked(&out).map_err(|err| {
+        let body = prefab_body(world, ast, &write_path).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("cannot save {}: {err}", prefab_path.display()),
