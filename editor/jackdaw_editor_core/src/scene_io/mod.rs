@@ -9,6 +9,7 @@ use bevy::ecs::reflect::AppTypeRegistry;
 use bevy::prelude::*;
 
 pub(crate) mod asset_fields;
+pub(crate) mod asset_names;
 pub mod hooks;
 mod legacy;
 mod load;
@@ -162,9 +163,19 @@ const ALWAYS_SAVE_PATHS: &[&str] = &[
     "bevy_picking::cursor::EntityCursor",
 ];
 
-/// The editor's own crates. Their components are editor bookkeeping and never
-/// persist unless [`ALWAYS_SAVE_PATHS`] names them.
-const EDITOR_TYPE_PREFIXES: &[&str] = &["jackdaw::", "jackdaw_editor_"];
+/// The editor's own crates, each spelled out so a game named `jackdaw_editor_*`
+/// keeps its components. Theirs are editor bookkeeping and never persist unless
+/// [`ALWAYS_SAVE_PATHS`] names them.
+const EDITOR_TYPE_PREFIXES: &[&str] = &[
+    "jackdaw::",
+    "jackdaw_editor_animation::",
+    "jackdaw_editor_core::",
+    "jackdaw_editor_launcher::",
+    "jackdaw_editor_modelling::",
+    "jackdaw_editor_remote::",
+    "jackdaw_editor_terrain::",
+    "jackdaw_editor_tile::",
+];
 
 pub fn should_skip_component(type_path: &str) -> bool {
     // Always-save takes priority over any skip rule
@@ -307,11 +318,26 @@ pub(crate) fn resync_entity_from_ast(world: &mut World, entity: Entity) {
     jackdaw_bsn::apply_ast_to_ecs(world, entity);
 }
 
+/// Forget the references left unresolved, which name assets of the project being
+/// left.
+pub fn forget_unresolved_references(world: &World) {
+    if let Some(unresolved) = world.get_resource::<jackdaw_bsn::UnresolvedReferences>() {
+        unresolved.clear();
+    }
+}
+
 pub struct SceneIoPlugin;
 
 impl Plugin for SceneIoPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SceneFilePath>()
+            .init_resource::<jackdaw_bsn::UnresolvedReferences>()
+            .init_resource::<asset_names::EmbeddedNames>()
+            .add_systems(
+                Update,
+                asset_names::relink_arrived_references
+                    .run_if(resource_exists_and_changed::<jackdaw_bsn::BsnSceneAssets>),
+            )
             .init_resource::<hooks::DocumentIoHooks>()
             .init_resource::<SceneDirtyState>()
             .add_systems(
@@ -416,5 +442,33 @@ mod camera_tests {
             is_active(&world, editor),
             "non-document cameras keep rendering"
         );
+    }
+}
+
+#[cfg(test)]
+mod editor_type_tests {
+    #[test]
+    fn a_game_named_like_an_editor_crate_keeps_its_components() {
+        assert!(!super::should_skip_component(
+            "jackdaw_editor_arena::Health"
+        ));
+        assert!(super::should_skip_component(
+            "jackdaw_editor_core::SomeBookkeeping"
+        ));
+    }
+
+    #[test]
+    fn every_editor_crate_is_listed_as_editor_code() {
+        let editor_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate sits in the editor folder");
+        for entry in std::fs::read_dir(editor_dir).expect("the editor folder reads") {
+            let name = entry.expect("an entry").file_name();
+            let prefix = format!("{}::", name.to_string_lossy());
+            assert!(
+                super::EDITOR_TYPE_PREFIXES.contains(&prefix.as_str()),
+                "{prefix} is missing from EDITOR_TYPE_PREFIXES"
+            );
+        }
     }
 }

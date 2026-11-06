@@ -22,13 +22,14 @@ pub use components::{
 };
 pub use model::{PrefabModel, prefab_model};
 pub use resolve::{
-    CycleError, MAX_PREFAB_DEPTH, PrefabLookup, ResolveError, clone_scene, read_isa_deleted,
-    read_isa_source, read_prefab_entity_id, resolve_scene, set_whole_component,
+    CycleError, MAX_PREFAB_DEPTH, PrefabLookup, ReferenceSpelling, ResolveError, clone_scene,
+    read_isa_deleted, read_isa_source, read_prefab_entity_id, resolve_scene, set_whole_component,
     sparsify_inherited_descendants, value_to_patch, would_cycle,
 };
 pub use source::{
     absolutize_isa_sources, isa_value, normalize_as_prefab_source, normalize_path,
-    read_prefab_document, relativize_isa_sources, relativize_isa_sources_under, source_path,
+    prepare_prefab_document, read_prefab_document, relativize_isa_sources,
+    relativize_isa_sources_under, source_path,
 };
 
 use bevy::prelude::*;
