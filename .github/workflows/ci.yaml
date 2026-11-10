@@ -5,13 +5,9 @@ on:
     branches: [main, "release-*"]
   pull_request:
     branches: [main, "release-*"]
-  # Pull requests only restore caches. This daily run on main saves any that
-  # were pushed out. Only the jobs that gain the most keep a cache, and
-  # `prune-caches` keeps one generation of each, so the saved keys fit the
-  # repository's 10 GB together. Off the hour, where scheduled runs start hours
-  # late.
-  schedule:
-    - cron: "17 2 * * *"
+  # Upstream also runs this daily on a schedule to re-save caches on main.
+  # Removed in this fork to stop nightly runs; pushes to main still save and
+  # prune them.
 
 # A new push to a pull request replaces its run; runs on main each finish, so
 # the post-merge checks report on every merge.
