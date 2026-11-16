@@ -29,14 +29,19 @@ impl Plugin for ScenesPlugin {
         app.add_systems(
             Update,
             (
-                mark_active_dirty_on_history_growth,
+                track_active_dirty_from_history,
                 persist_tabs_to_project_config,
                 ui::rebuild_scene_tab_strip,
                 ui::update_scene_tab_visuals,
                 ui::update_scene_tab_label_abbreviation,
                 ui::show_scene_tab_close_on_hover,
                 intercept_window_close,
+                swap::report_read_back_checks.run_if(resource_exists::<swap::ReadBackChecks>),
             ),
+        );
+        app.add_systems(
+            First,
+            ui::run_pending_tab_switch.run_if(resource_exists::<ui::PendingTabSwitch>),
         );
         app.add_observer(ui::on_scene_tab_context_action);
         app.add_plugins(external_watch::ExternalSceneWatchPlugin);
@@ -52,12 +57,25 @@ pub fn intercept_window_close(
     scenes: Res<Scenes>,
     mut commands: Commands,
     mut pending: ResMut<confirm_dialog::PendingQuit>,
+    saves: Option<Res<crate::scene_io::save_worker::SceneSaves>>,
 ) {
     let mut close_requested = false;
     for _ in close_events.read() {
         close_requested = true;
     }
     if !close_requested {
+        return;
+    }
+
+    // The tab being saved may read dirty only until the file lands, and leaving now
+    // would lose the file.
+    if saves.is_some_and(|saves| !saves.idle()) {
+        commands.queue(|world: &mut World| {
+            crate::scene_io::save_worker::after_saves(
+                world,
+                crate::scene_io::save_worker::AfterSaves::CloseWindow,
+            );
+        });
         return;
     }
 
@@ -77,6 +95,21 @@ pub fn intercept_window_close(
     commands.queue(|world: &mut World| {
         confirm_dialog::spawn_confirm_quit_dialog(world);
     });
+}
+
+/// [`intercept_window_close`] again, once the saves it waited for are over.
+pub(crate) fn ask_to_quit(world: &mut World) {
+    if !world.resource::<Scenes>().tabs.iter().any(|t| t.dirty) {
+        world.write_message(bevy::app::AppExit::Success);
+        return;
+    }
+    let mut pending = world.resource_mut::<confirm_dialog::PendingQuit>();
+    if pending.active {
+        return;
+    }
+    pending.active = true;
+    pending.leaving_project = false;
+    confirm_dialog::spawn_confirm_quit_dialog(world);
 }
 
 #[derive(Resource, Default)]
@@ -126,6 +159,8 @@ impl Default for TabContent {
 }
 
 pub struct SceneTab {
+    /// Which tab this is, whatever index it has moved to.
+    pub id: u64,
     pub path: Option<PathBuf>,
     pub display_name: String,
     pub dirty: bool,
@@ -139,12 +174,11 @@ pub struct SceneTab {
     /// Extensions' [`SceneResource`] values owned by this tab while it is
     /// inactive, like the terrain data.
     pub scene_resources: TabResources,
-    /// Recorded `CommandHistory.undo_stack.len()` as of the last time
-    /// the dirty-tracking system ran (or the tab was activated, or
-    /// saved). If the live history is deeper than this, the user has
-    /// made a change since the last check, and the tab is marked
-    /// `dirty`.
-    pub history_depth_at_last_check: usize,
+    /// `CommandHistory::state` as of the last time the dirty-tracking system ran
+    /// or the tab was saved, and `None` until it first runs with this tab in
+    /// front. `dirty` follows the history whenever the state has moved on from
+    /// this.
+    pub history_state_at_last_check: Option<u64>,
     /// Why the tab is in front without its contents in the world, if it is.
     /// Set, the world is not the file's contents and must not be written back.
     pub refusal: Option<TabRefusal>,
@@ -156,15 +190,13 @@ pub struct SceneTab {
 pub enum TabRefusal {
     /// The document names vocabulary this build will not spawn.
     Rejected(String),
-    /// The spawn was attempted and failed.
-    SpawnFailed(String),
 }
 
 impl TabRefusal {
     /// The message shown for a save this refusal blocks.
     pub fn reason(&self) -> &str {
         match self {
-            Self::Rejected(reason) | Self::SpawnFailed(reason) => reason,
+            Self::Rejected(reason) => reason,
         }
     }
 }
@@ -176,7 +208,9 @@ impl SceneTab {
     }
 
     pub fn new_untitled(n: u32) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             path: None,
             display_name: format!("untitled-{n}"),
             dirty: false,
@@ -186,7 +220,7 @@ impl SceneTab {
             history: CommandHistory::default(),
             terrain_data_store: TerrainDataStore::default(),
             scene_resources: TabResources::default(),
-            history_depth_at_last_check: 0,
+            history_state_at_last_check: None,
             refusal: None,
         }
     }
@@ -263,33 +297,48 @@ pub fn persist_tabs_to_project_config(
     }
 }
 
-/// Per-frame system: compare the active tab's recorded history depth
-/// with the live `CommandHistory`. Any growth means the user did
-/// something; mark the tab dirty. Shrinkage (undo) is ignored. Save
-/// resets the recorded depth.
-pub fn mark_active_dirty_on_history_growth(
-    history: Res<CommandHistory>,
-    mut scenes: ResMut<Scenes>,
-) {
+/// Per-frame system: when the active tab's history has moved to another state, the
+/// tab is dirty unless that is the state its file holds. An edit makes it dirty, and
+/// an undo or a redo back to the saved state clean. A tab just brought forward keeps
+/// its flag, which can say more than its history: a document that needed its ids
+/// healed on opening is unsaved with no edit.
+pub fn track_active_dirty_from_history(history: Res<CommandHistory>, mut scenes: ResMut<Scenes>) {
     if scenes.tabs.is_empty() {
         return;
     }
     let active = scenes.active;
-    let current_depth = history.undo_stack.len();
+    let state = history.state();
     let tab = scenes.bypass_change_detection().tabs.get_mut(active);
     let Some(tab) = tab else { return };
-    let recorded = tab.history_depth_at_last_check;
-    let needs_dirty_flip = current_depth > recorded && !tab.dirty;
-    let needs_depth_update = current_depth != recorded;
-    if !needs_dirty_flip && !needs_depth_update {
+    let recorded = tab.history_state_at_last_check;
+    if recorded == Some(state) {
         return;
     }
-    scenes.set_changed();
-    let tab = &mut scenes.tabs[active];
-    if needs_dirty_flip {
+    let dirty = match recorded {
+        Some(_) => !history.is_saved(),
+        None => tab.dirty || !history.is_saved(),
+    };
+    let unchanged = tab.dirty == dirty && recorded.is_some();
+    tab.dirty = dirty;
+    tab.history_state_at_last_check = Some(state);
+    if !unchanged {
+        scenes.set_changed();
+    }
+}
+
+/// Record that the files of tab `index` hold no state on its history: it reads dirty,
+/// and no undo or redo makes it read clean before the next save.
+pub(crate) fn mark_tab_unsaved(world: &mut World, index: usize) {
+    let in_front = world.resource::<Scenes>().active == index;
+    if in_front {
+        world.resource_mut::<CommandHistory>().forget_saved();
+    }
+    if let Some(tab) = world.resource_mut::<Scenes>().tabs.get_mut(index) {
+        if !in_front {
+            tab.history.forget_saved();
+        }
         tab.dirty = true;
     }
-    tab.history_depth_at_last_check = current_depth;
 }
 
 #[derive(Default, Clone)]

@@ -23,17 +23,17 @@ pub mod syntax;
 pub mod writer;
 
 pub use catalog::{
-    CatalogAssetRef, CatalogEntry, LoadedBsnScene, adopt_asset_roots, append_assets_to_ast,
-    asset_roots, asset_value_from_root, entity_roots, is_asset_root, load_asset_root,
-    load_bsn_assets, load_bsn_assets_onto, load_bsn_document, load_bsn_scene,
-    serialize_assets_to_bsn, serialize_assets_to_bsn_reporting,
+    AdoptedAssets, CatalogAssetRef, CatalogEntry, LoadedBsnScene, adopt_asset_roots,
+    append_assets_to_ast, asset_roots, asset_value_from_root, entity_roots, is_asset_root,
+    load_asset_root, load_bsn_assets, load_bsn_assets_onto, load_bsn_document, load_bsn_scene,
+    load_document_assets_onto, serialize_assets_to_bsn, serialize_assets_to_bsn_reporting,
 };
 
 pub use header::{
     ASSET_HEADER, AssetFileError, DocumentOpening, PREFAB_TYPE, StemIndex, asset_file_type,
-    asset_stem, asset_text_type, document_type_path, path_stem, read_asset_file, read_asset_header,
-    read_asset_text, read_document_opening, root_type_path, walk_asset_files, walk_document_files,
-    walk_files_with_extensions, with_asset_header,
+    asset_stem, asset_text_type, document_type_path, names_prefab_marker, path_stem,
+    read_asset_file, read_asset_header, read_asset_text, read_document_opening, root_type_path,
+    walk_asset_files, walk_document_files, walk_files_with_extensions, with_asset_header,
 };
 
 pub use binary::{BinaryError, DecodedDocument, is_binary};
@@ -55,11 +55,11 @@ pub use document::{
     BsnStructFields, BsnTupleStructData, BsnValue, MAX_AST_DEPTH, SceneBsnAst, TypeDefaults,
     UnencodableValue, bsn_value_as_int, clone_node_into, clone_subtree_into, compact_document,
     component_to_bsn_patch, component_to_bsn_patch_in_pass, component_to_bsn_patch_with_assets,
-    is_enum_variant_of, patch_type_path, type_paths_include,
+    drop_document, is_enum_variant_of, patch_type_path, type_paths_include,
 };
 pub use emitter::{
-    UnparsableEmit, brush_text_len, emit_entities, emit_entity, emit_entity_without_children,
-    emit_scene, emit_scene_checked, emit_value_text, parse_emitted,
+    UnparsableEmit, emit_entities, emit_entity, emit_entity_without_children, emit_scene,
+    emit_scene_checked, emit_scene_sizing_brushes, emit_value_text, parse_emitted,
 };
 pub use loader::{BsnLoadError, parse_bsn_text, parses_on_this_thread};
 pub use retired::{RETIRED_UI_PREFIX, RetiredUiComponents, reject_retired_ui_components};
@@ -76,7 +76,7 @@ pub use apply::{
 
 pub use sync::{
     create_entity_in_ast, delete_entity_from_ast, sync_hierarchy_to_ast, sync_hierarchy_to_ast_at,
-    sync_to_ast, sync_to_ast_naming,
+    sync_to_ast,
 };
 
 pub use writer::{

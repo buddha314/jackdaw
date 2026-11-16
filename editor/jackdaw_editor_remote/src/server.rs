@@ -31,6 +31,7 @@ use path_slash::PathExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use jackdaw_editor_core::game_query::{GameEntityRef, GameQueries, GameQuery, ask_game};
 use jackdaw_editor_core::project::ProjectRoot;
 use jackdaw_editor_core::scenes::Scenes;
 use jackdaw_editor_core::screenshot::CaptureError;
@@ -184,7 +185,11 @@ impl Plugin for JackdawEditorRemotePlugin {
                     .with_watching_method_main("jackdaw/assets", assets_handler)
                     .with_watching_method_main("jackdaw/screenshot", screenshot_handler)
                     .with_watching_method_main("jackdaw/views", views_handler)
-                    .with_watching_method_main("jackdaw/wait", wait_handler),
+                    .with_watching_method_main("jackdaw/wait", wait_handler)
+                    .with_watching_method_main("jackdaw/game_entities", game_entities_handler)
+                    .with_watching_method_main("jackdaw/game_entity", game_entity_handler)
+                    .with_watching_method_main("jackdaw/game_query", game_query_handler)
+                    .with_method_main("jackdaw/game_output", game_output_handler),
             )
             // No CORS headers: allowing an origin would hand any page served on
             // loopback write access to the open scene.
@@ -391,10 +396,59 @@ pub fn status_handler(In(_): In<Option<Value>>, world: &mut World) -> BrpResult 
         // and holding the editor until an entry is taken or `modal.cancel`
         // drops it.
         "picker": open_picker(world),
-        // `building`, `running` or `stopped`: what play-in-editor is
+        // `building`, `running`, `paused`, `failed` or `stopped`: what Play is
         // doing, which `jackdaw/wait` can be held on.
         "pie": jackdaw_editor_core::pie::play_status(world),
+        "instances": game_instances(world),
+        "game_frame": game_frame(world),
     }))
+}
+
+/// The frames the Game panel holds from the focused game: null until the first
+/// arrives, and `own_window` alone when the game shows itself in its own window
+/// and sends none. Ages are milliseconds since the first and newest frame.
+fn game_frame(world: &World) -> Value {
+    let Some(stream) = world.get_resource::<jackdaw_editor_core::live_frame::LiveFrameStream>()
+    else {
+        return Value::Null;
+    };
+    let age = |at: Option<std::time::Instant>| at.map(|at| at.elapsed().as_millis() as u64);
+    if stream.has_frame() {
+        json!({
+            "seq": stream.last_seq,
+            "width": stream.size.x,
+            "height": stream.size.y,
+            "fresh": stream.is_fresh(),
+            "first_age_ms": age(stream.first_received_at),
+            "age_ms": age(stream.received_at),
+        })
+    } else if stream.game_has_own_window {
+        json!({ "own_window": true })
+    } else {
+        Value::Null
+    }
+}
+
+/// Every game instance Play launched, each `building`, `connecting` or
+/// `connected`. `focused` marks the one the game methods ask.
+fn game_instances(world: &World) -> Vec<Value> {
+    let focused = world
+        .get_resource::<jackdaw_editor_core::pie::PieInstances>()
+        .and_then(|instances| instances.focused.clone());
+    world
+        .get_non_send::<jackdaw_editor_core::pie::PieSession>()
+        .map(jackdaw_editor_core::pie::PieSession::instance_stages)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, stage)| {
+            json!({
+                "config": key.config,
+                "instance": key.instance,
+                "stage": stage,
+                "focused": focused.as_ref() == Some(&key),
+            })
+        })
+        .collect()
 }
 
 /// The list of choices on screen: which list it is, and the entries it offers
@@ -518,7 +572,8 @@ pub fn cancel_handler(In(_): In<Option<Value>>, world: &mut World) -> BrpResult 
         .map_err(|err| internal_error(err.to_string()))?;
     Ok(json!({ "cancelled": id }))
 }
-/// The scene as the outliner shows it. `root` names the node to report and
+/// The scene as the outliner shows it, in its order. Each node carries its
+/// `node` id, which `jackdaw/game_entity` takes. `root` names the node to report and
 /// `depth` counts generations below it; absent, they mean the whole scene.
 /// `filter` is an entity reference: the nodes it matches (within `root`, when
 /// given) are reported as the roots, the topmost one where one sits under
@@ -593,8 +648,13 @@ fn node_json(world: &mut World, entity: Entity, depth: u32) -> Value {
         .map(|child| node_json(world, child, depth.saturating_sub(1)))
         .collect();
 
+    let node = world
+        .get::<jackdaw_scene_types::SceneNodeId>(entity)
+        .map(|node| node.0);
+
     json!({
         "entity": entity.to_bits(),
+        "node": node,
         "name": name,
         "missing_source": missing_source,
         "components": components,
@@ -764,7 +824,7 @@ pub fn assets_handler(
 ) -> BrpResult<Option<Value>> {
     check_enabled(world)?;
     let params = params.unwrap_or(Value::Null);
-    let key = request_key(&params);
+    let key = request_key("jackdaw/assets", &params);
     let frame = current_frame(world);
     expire_stale(world, frame);
 
@@ -1018,7 +1078,7 @@ pub fn screenshot_handler(
         .and_then(Value::as_str)
         .unwrap_or("viewport")
         .to_string();
-    let key = request_key(&params);
+    let key = request_key("jackdaw/screenshot", &params);
 
     let frame = current_frame(world);
     expire_stale(world, frame);
@@ -1341,7 +1401,7 @@ fn default_capture_path(world: &World, kind: &str) -> PathBuf {
 pub fn views_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult<Option<Value>> {
     check_enabled(world)?;
     let params = params.unwrap_or(Value::Null);
-    let key = request_key(&params);
+    let key = request_key("jackdaw/views", &params);
     let frame = current_frame(world);
     expire_stale(world, frame);
 
@@ -1791,7 +1851,8 @@ fn write_views(
 }
 
 /// Let frames pass, or wait for the editor to reach a state. `until` takes
-/// `idle`, `pie_running` or `pie_stopped`; without it the call waits `frames`.
+/// `idle`, `pie_running` (a paused game counts) or `pie_stopped`; without it
+/// the call waits `frames`.
 pub fn wait_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult<Option<Value>> {
     check_enabled(world)?;
     let params = params.unwrap_or(Value::Null);
@@ -1820,7 +1881,7 @@ pub fn wait_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResu
     }
 
     let frames = params.get("frames").and_then(Value::as_u64).unwrap_or(1) as u32;
-    let key = request_key(&params);
+    let key = request_key("jackdaw/wait", &params);
     let mut waits = world.get_resource_or_init::<PendingWaits>();
     // The frame the wait is over, rather than a countdown: a poll is not a
     // frame, and two clients sharing a key would each decrement one countdown.
@@ -1847,22 +1908,29 @@ pub fn wait_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResu
 /// otherwise. Ten minutes at 60fps, since a game build takes minutes.
 const PIE_WAIT_FRAMES: u32 = 36_000;
 
-/// Hold until play-in-editor reaches `wanted`, the build behind it fails, or the
-/// wait runs out of frames. A `pie_stopped` wait resolves only once a game has
-/// been seen building or up, since `pie.play` returns while the editor still
-/// reads as stopped.
+/// Frames a `pie_stopped` wait that has seen no game gives a `pie.play` sent
+/// just before it to register its launch.
+const PIE_STOP_GRACE_FRAMES: u32 = 30;
+
+/// Hold until Play reaches `wanted`, the build behind it fails, or the
+/// wait runs out of frames. A `pie_stopped` wait resolves once Play reads as
+/// stopped with no instance launched or building, since `pie.play` returns
+/// while the editor still reads as stopped.
 fn pie_wait(
     world: &mut World,
     params: &Value,
     wanted: &'static str,
     frame: u32,
 ) -> BrpResult<Option<Value>> {
-    let key = request_key(params);
+    let key = request_key("jackdaw/wait", params);
     let status = jackdaw_editor_core::pie::play_status(world);
     let cap = params
         .get("frames")
         .and_then(Value::as_u64)
         .map_or(PIE_WAIT_FRAMES, |frames| frames as u32);
+    let launched = world
+        .get_non_send::<jackdaw_editor_core::pie::PieSession>()
+        .is_some_and(|session| !session.instance_stages().is_empty());
 
     let mut waits = world.get_resource_or_init::<PendingWaits>();
     let pending = waits.requests.entry(key.clone()).or_insert(PendingRequest {
@@ -1879,18 +1947,26 @@ fn pie_wait(
             "request {key} is already waiting on something else"
         )));
     };
-    wait.seen_active |= status != "stopped";
+    wait.seen_active |= status != "stopped" || launched;
+    let settled =
+        wait.seen_active || frame >= wait.until.saturating_sub(cap) + PIE_STOP_GRACE_FRAMES;
     let reached = match wait.wanted {
-        "running" => status == "running",
-        _ => wait.seen_active && status == "stopped",
+        "running" => matches!(status, "running" | "paused"),
+        _ => status == "stopped" && !launched && settled,
     };
+    let gone = wait.wanted == "running" && wait.seen_active && status == "stopped" && !launched;
     let out_of_frames = frame >= wait.until;
 
-    // A build that did not compile ends every wait on it; holding for the frame
-    // cap would report the failure as a timeout.
+    // A build that did not compile, or a game that went away before it
+    // connected, ends every wait on it; holding for the frame cap would report
+    // the failure as a timeout.
     if status == "failed" {
         waits.requests.remove(&key);
         return Err(internal_error("the game build failed"));
+    }
+    if gone {
+        waits.requests.remove(&key);
+        return Err(internal_error("the game stopped before it connected"));
     }
     if reached {
         waits.requests.remove(&key);
@@ -1903,6 +1979,230 @@ fn pie_wait(
         )));
     }
     Ok(None)
+}
+
+/// The running game's entities that no scene node spawned, with the authored
+/// entities they sit under.
+pub fn game_entities_handler(
+    In(params): In<Option<Value>>,
+    world: &mut World,
+) -> BrpResult<Option<Value>> {
+    ask_the_game(world, "jackdaw/game_entities", params, |_| {
+        Ok(GameQuery::Runtime)
+    })
+}
+
+/// One entity of the running game with all its components, by `entity` (its
+/// bits in the game) or every entity of the scene node `node`.
+pub fn game_entity_handler(
+    In(params): In<Option<Value>>,
+    world: &mut World,
+) -> BrpResult<Option<Value>> {
+    ask_the_game(world, "jackdaw/game_entity", params, |params| {
+        let id = |name: &str| params.get(name).and_then(Value::as_u64);
+        match (id("entity"), id("node")) {
+            (Some(entity), _) => Ok(GameQuery::Entity(GameEntityRef::Entity(entity))),
+            (None, Some(node)) => Ok(GameQuery::Entity(GameEntityRef::Node(node))),
+            (None, None) => Err(invalid_params("pass `entity` or `node`")),
+        }
+    })
+}
+
+/// The running game's entities holding the component `with` (a type path), and
+/// whose name contains `name`, each with the value of `with`.
+pub fn game_query_handler(
+    In(params): In<Option<Value>>,
+    world: &mut World,
+) -> BrpResult<Option<Value>> {
+    ask_the_game(world, "jackdaw/game_query", params, |params| {
+        let text = |name: &str| params.get(name).and_then(Value::as_str).map(str::to_string);
+        Ok(GameQuery::Find {
+            with: text("with"),
+            name: text("name"),
+        })
+    })
+}
+
+/// How many lines `jackdaw/game_output` answers with when not told.
+const GAME_OUTPUT_LIMIT: usize = 200;
+
+/// What a game instance printed. `instance` names it as the Game panel does
+/// ("Client 2"), by its run configuration, or as `{config, instance}`, and
+/// defaults to the instance the Game Output window shows. `since` answers
+/// with the lines from that sequence number on, else the last ones, up to
+/// `limit`.
+pub fn game_output_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
+    use jackdaw_editor_core::game_output::GameOutput;
+    use jackdaw_editor_core::game_output_window::{output_instances, shown_instance};
+
+    check_enabled(world)?;
+    let params = params.unwrap_or(Value::Null);
+    let instances = output_instances(world);
+    let key = match params.get("instance") {
+        None | Some(Value::Null) => shown_instance(world),
+        Some(Value::String(name)) => Some(
+            instances
+                .iter()
+                .find(|(_, shown)| shown == name)
+                .or_else(|| {
+                    instances
+                        .iter()
+                        .find(|(key, _)| key.config == *name && key.instance == 1)
+                })
+                .map(|(key, _)| key.clone())
+                .ok_or_else(|| invalid_params(format!("no game instance `{name}` has output")))?,
+        ),
+        Some(Value::Object(fields)) => {
+            let config = fields
+                .get("config")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_params("`instance.config` must be a string"))?;
+            let instance = fields.get("instance").map_or(Some(1), Value::as_u64);
+            let instance = instance
+                .and_then(|instance| u32::try_from(instance).ok())
+                .ok_or_else(|| invalid_params("`instance.instance` must be a number from 1"))?;
+            Some(jackdaw_editor_core::pie::InstanceKey {
+                config: config.to_string(),
+                instance,
+            })
+        }
+        Some(_) => {
+            return Err(invalid_params(
+                "`instance` must be a name or {config, instance}",
+            ));
+        }
+    };
+    let since = match params.get("since") {
+        None | Some(Value::Null) => None,
+        Some(since) => Some(
+            since
+                .as_u64()
+                .ok_or_else(|| invalid_params("`since` must be a sequence number"))?,
+        ),
+    };
+    let limit = match params.get("limit") {
+        None | Some(Value::Null) => GAME_OUTPUT_LIMIT,
+        Some(limit) => limit
+            .as_u64()
+            .and_then(|limit| usize::try_from(limit).ok())
+            .ok_or_else(|| invalid_params("`limit` must be a count"))?,
+    };
+    let names: Vec<&String> = instances.iter().map(|(_, name)| name).collect();
+    let Some(key) = key else {
+        return Ok(json!({
+            "instance": null,
+            "instances": names,
+            "running": false,
+            "lines": [],
+            "first": 0,
+            "next": 0,
+            "more": false,
+        }));
+    };
+    let page = world
+        .get_resource::<GameOutput>()
+        .and_then(|output| output.page(&key, since, limit))
+        .ok_or_else(|| invalid_params(format!("game instance {key} has no output")))?;
+    let running = world
+        .get_non_send::<jackdaw_editor_core::pie::PieSession>()
+        .is_some_and(|session| session.is_running(&key));
+    let name = instances
+        .iter()
+        .find(|(held, _)| *held == key)
+        .map(|(_, name)| name.clone());
+    let next = if let Some(last) = page.lines.last() {
+        last.seq + 1
+    } else if let Some(since) = since {
+        since.min(page.next_seq)
+    } else {
+        page.first_seq
+    };
+    let lines: Vec<Value> = page
+        .lines
+        .iter()
+        .map(|line| json!({ "seq": line.seq, "stream": line.stream.name(), "text": &*line.text }))
+        .collect();
+    Ok(json!({
+        "instance": { "config": key.config, "instance": key.instance, "name": name },
+        "instances": names,
+        "running": running,
+        "lines": lines,
+        "first": page.first_seq,
+        "next": next,
+        "more": page.more,
+    }))
+}
+
+/// Ask the running game the question `query` makes of the params on the first
+/// poll, and answer with its entities once the game replies. The poll the HTTP
+/// layer makes just after the answer goes out finds it answered and asks nothing.
+fn ask_the_game(
+    world: &mut World,
+    method: &str,
+    params: Option<Value>,
+    query: impl FnOnce(&Value) -> BrpResult<GameQuery>,
+) -> BrpResult<Option<Value>> {
+    check_enabled(world)?;
+    let params = params.unwrap_or(Value::Null);
+    let frame = current_frame(world);
+    expire_stale(world, frame);
+    let key = request_key(method, &params);
+    let held = match world
+        .get_resource_or_init::<PendingWaits>()
+        .requests
+        .get_mut(&key)
+    {
+        Some(PendingRequest {
+            state: PendingState::Answered,
+            last_seen,
+        }) if frame <= last_seen.saturating_add(1) => return Ok(None),
+        None
+        | Some(PendingRequest {
+            state: PendingState::Answered,
+            ..
+        }) => None,
+        Some(pending) => {
+            pending.last_seen = frame;
+            match pending.state {
+                PendingState::Game { request } => Some(request),
+                _ => {
+                    return Err(internal_error(format!(
+                        "request {key} is already waiting on something else"
+                    )));
+                }
+            }
+        }
+    };
+    let held = held.filter(|&request| world.get_resource_or_init::<GameQueries>().holds(request));
+    let request = match held {
+        Some(request) => request,
+        None => {
+            let request = ask_game(world, query(&params)?).map_err(internal_error)?;
+            world.resource_mut::<PendingWaits>().requests.insert(
+                key.clone(),
+                PendingRequest {
+                    last_seen: frame,
+                    state: PendingState::Game { request },
+                },
+            );
+            request
+        }
+    };
+    let Some(answer) = world.get_resource_or_init::<GameQueries>().take(request) else {
+        return Ok(None);
+    };
+    world.resource_mut::<PendingWaits>().requests.insert(
+        key,
+        PendingRequest {
+            last_seen: frame,
+            state: PendingState::Answered,
+        },
+    );
+    let found = answer.map_err(internal_error)?;
+    Ok(Some(json!({
+        "entities": found.entities,
+        "truncated": found.truncated,
+    })))
 }
 
 /// Work the editor started on its own and has not finished.
@@ -2029,13 +2329,13 @@ fn expire_stale(world: &mut World, frame: u32) {
     }
 }
 
-/// The key a watching request is tracked under. A client that passes `request`
-/// gets an identity of its own; one that does not shares state with any
-/// concurrent call spelled identically.
-fn request_key(params: &Value) -> String {
+/// The key a watching request to `method` is tracked under. A client that passes
+/// `request` gets an identity of its own; one that does not shares state with any
+/// concurrent call to the same method spelled identically.
+fn request_key(method: &str, params: &Value) -> String {
     match params.get("request").and_then(Value::as_str) {
-        Some(id) => format!("id:{id}"),
-        None => format!("params:{params}"),
+        Some(id) => format!("id:{method}:{id}"),
+        None => format!("params:{method}:{params}"),
     }
 }
 
@@ -2068,11 +2368,13 @@ enum PendingState {
     Frames { until: u32 },
     /// The asset walk running on the IO pool.
     Assets { task: Task<Vec<String>> },
-    /// A play-in-editor state being held for.
+    /// A Play state being held for.
     Pie(PieWait),
+    /// A question the running game has yet to answer.
+    Game { request: u64 },
 }
 
-/// A wait held on a play-in-editor state.
+/// A wait held on a Play state.
 struct PieWait {
     /// The status the caller asked for.
     wanted: &'static str,
@@ -2154,5 +2456,40 @@ mod tests {
     #[test]
     fn the_editor_port_is_not_the_game_port() {
         assert_ne!(DEFAULT_PORT, jackdaw_remote::DEFAULT_PORT);
+    }
+
+    #[test]
+    fn status_reports_a_game_frame_only_once_the_panel_holds_one() {
+        use jackdaw_editor_core::live_frame::LiveFrameStream;
+
+        let mut world = World::new();
+        assert_eq!(game_frame(&world), Value::Null);
+        world.init_resource::<LiveFrameStream>();
+        assert_eq!(game_frame(&world), Value::Null);
+
+        world.resource_mut::<LiveFrameStream>().game_has_own_window = true;
+        assert_eq!(game_frame(&world), json!({ "own_window": true }));
+
+        let now = std::time::Instant::now();
+        let mut stream = world.resource_mut::<LiveFrameStream>();
+        stream.game_has_own_window = false;
+        stream.image = Some(Handle::default());
+        stream.size = UVec2::new(64, 32);
+        stream.last_seq = 3;
+        stream.received_at = Some(now);
+        stream.first_received_at = now.checked_sub(std::time::Duration::from_secs(2));
+        let frame = game_frame(&world);
+        assert_eq!(
+            (
+                &frame["seq"],
+                &frame["width"],
+                &frame["height"],
+                &frame["fresh"]
+            ),
+            (&json!(3), &json!(64), &json!(32), &json!(true))
+        );
+        let first = frame["first_age_ms"].as_u64().unwrap();
+        let newest = frame["age_ms"].as_u64().unwrap();
+        assert!(first >= 2000 && newest < first, "{frame}");
     }
 }

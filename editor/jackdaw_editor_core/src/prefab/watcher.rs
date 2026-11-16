@@ -4,6 +4,7 @@
 
 use bevy::prelude::*;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -264,7 +265,12 @@ fn drain_changes(world: &mut World) {
         }
         if let Some(sparse_text) = &sparse_text {
             match reload_instances_of(world, sparse_text, &cache_key) {
-                PrefabReload::Instances => reloaded = true,
+                PrefabReload::Instances => {
+                    world
+                        .resource_mut::<PrefabAstCache>()
+                        .answer_changes_of(&cache_key);
+                    reloaded = true;
+                }
                 PrefabReload::Unhandled => {
                     respawn_scene(world, sparse_text);
                     reloaded = true;
@@ -313,13 +319,15 @@ pub(crate) fn return_prefab_to_file(world: &mut World, path: &Path, reload: bool
         return;
     };
     match reload_instances_of(world, &sparse_text, path) {
-        PrefabReload::Instances => rebuild_outliner(world),
-        PrefabReload::Unhandled => {
-            respawn_scene(world, &sparse_text);
-            rebuild_outliner(world);
+        PrefabReload::Instances => {
+            world
+                .resource_mut::<PrefabAstCache>()
+                .answer_changes_of(path);
         }
-        PrefabReload::Nothing => {}
+        PrefabReload::Unhandled => respawn_scene(world, &sparse_text),
+        PrefabReload::Nothing => return,
     }
+    rebuild_outliner(world);
 }
 
 /// What a per-file reload did, and so what the caller has left to do.
@@ -327,10 +335,11 @@ pub enum PrefabReload {
     /// The file's instances were respawned in place; other entities kept
     /// their ids.
     Instances,
-    /// Nothing inherits from the file directly, or an instance does not line
-    /// up with a resolved root. The caller respawns the whole scene.
+    /// An instance does not line up with a resolved root. The caller respawns
+    /// the whole scene.
     Unhandled,
-    /// The new text did not parse or resolve, and the scene is untouched.
+    /// The scene does not draw from the file, or the new text did not parse or
+    /// resolve, and the scene is untouched.
     Nothing,
 }
 
@@ -346,20 +355,27 @@ pub fn reload_instances_of(world: &mut World, sparse_text: &str, changed: &Path)
         };
         jackdaw_bsn::entity_roots(live, &reg)
     };
+    // An instance of a prefab that inherits from the changed one is affected
+    // too, though its own `IsA` names only its prefab.
     let instances: Vec<Entity> = {
         let live = world.resource::<jackdaw_bsn::SceneBsnAst>();
+        let cache = world.resource::<PrefabAstCache>();
+        let mut affected: HashMap<crate::prefab::CanonicalPrefabPath, bool> = HashMap::new();
         live.entities_with_component(ISA_TYPE)
             .into_iter()
             .filter(|&node| {
-                crate::prefab::resolver_bsn::read_isa_source(live, node)
-                    .is_some_and(|source| crate::prefab::canonical_prefab_path(source) == wanted)
+                crate::prefab::resolver_bsn::read_isa_source(live, node).is_some_and(|source| {
+                    *affected
+                        .entry(crate::prefab::canonical_prefab_path(&source))
+                        .or_insert_with_key(|source| cache.inherits_from(source.as_ref(), &wanted))
+                })
             })
             .collect()
     };
-    // A prefab only another prefab references has no instance node here; the
-    // whole-scene path picks it up through the cache.
+    // The instances cover nested ones too, so none means the scene does not draw
+    // from the file.
     if instances.is_empty() {
-        return PrefabReload::Unhandled;
+        return PrefabReload::Nothing;
     }
     let at_root: Option<Vec<usize>> = instances
         .iter()
@@ -398,9 +414,14 @@ pub fn reload_instances_of(world: &mut World, sparse_text: &str, changed: &Path)
         let Some(&counterpart) = resolved_roots.get(index) else {
             return PrefabReload::Unhandled;
         };
-        if crate::prefab::resolver_bsn::read_isa_source(&resolved, counterpart)
-            .is_none_or(|source| crate::prefab::canonical_prefab_path(source) != wanted)
-        {
+        let live_source = crate::prefab::resolver_bsn::read_isa_source(
+            world.resource::<jackdaw_bsn::SceneBsnAst>(),
+            node,
+        )
+        .map(crate::prefab::canonical_prefab_path);
+        let resolved_source = crate::prefab::resolver_bsn::read_isa_source(&resolved, counterpart)
+            .map(crate::prefab::canonical_prefab_path);
+        if live_source.is_none() || live_source != resolved_source {
             return PrefabReload::Unhandled;
         }
         pairs.push((node, counterpart));
@@ -568,6 +589,7 @@ fn respawn_scene(world: &mut World, sparse_text: &str) {
     // `load_bsn_document` installs the resolved document as the live
     // `SceneBsnAst`, re-adds inline assets, and applies patches.
     jackdaw_bsn::load_bsn_document(world, resolved);
+    world.resource_mut::<PrefabAstCache>().answer_changes();
 }
 
 #[cfg(test)]

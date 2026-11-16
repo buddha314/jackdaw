@@ -28,7 +28,6 @@ pub mod cli;
 pub mod clip_ops;
 pub mod command_palette;
 pub mod commands;
-pub mod component_json;
 pub mod creation_taxonomy;
 pub mod custom_properties;
 pub mod default_style;
@@ -40,7 +39,10 @@ pub mod entity_refs;
 pub mod environment_ops;
 pub mod face_grid;
 pub use jackdaw_runtime::frame_work;
+pub mod game_output;
+pub mod game_output_window;
 pub mod game_panel;
+pub mod game_panel_header;
 pub mod gizmo_ops;
 pub mod gizmos;
 pub mod grid_ops;
@@ -85,12 +87,11 @@ pub mod extension_slots;
 pub mod extensions_dialog;
 pub mod file_ops;
 pub mod fps_overlay;
+pub mod game_query;
 pub mod hot_reload;
 pub mod launch;
 pub mod launcher_mode;
 pub mod layout;
-pub mod live_edits;
-pub mod live_edits_ui;
 pub mod live_frame;
 pub mod live_frame_view;
 pub mod live_highlight;
@@ -118,12 +119,12 @@ pub mod operator_tooltip;
 pub mod perf_probe;
 pub mod pie;
 pub mod pie_menu;
-pub mod pie_mirror;
 mod pie_outbox;
-pub mod pie_projection;
 pub mod play_overlay;
+pub mod play_revert;
 pub mod play_scene;
 pub mod play_settings;
+mod play_structure;
 pub mod play_sync;
 pub mod prefab;
 pub mod preflight;
@@ -148,6 +149,7 @@ pub mod remote_ops;
 pub mod render_diagnostics;
 pub mod restart;
 pub mod run_config;
+pub mod runtime_outliner;
 pub use jackdaw_scaffold as scaffold;
 pub mod pixel_camera;
 pub mod scene_io;
@@ -208,6 +210,7 @@ pub mod viewport_settings_menu;
 pub mod viewport_util;
 pub mod views;
 pub mod windowing;
+mod worker_task;
 pub mod workspace_dropdown;
 pub mod world_units;
 pub mod worn_material;
@@ -495,6 +498,7 @@ impl Plugin for EditorCorePlugin {
                 view_modes::ViewModesPlugin,
                 status_bar::StatusBarPlugin,
                 build_panel::BuildPanelPlugin,
+                game_output_window::GameOutputWindowPlugin,
                 project_window::ProjectWindowPlugin,
                 modal_transform::ModalTransformPlugin,
             ),
@@ -561,10 +565,11 @@ impl Plugin for EditorCorePlugin {
         .add_plugins(pie::PiePlugin)
         .add_plugins(project_build::ProjectBuildPlugin)
         .add_plugins(play_sync::plugin)
+        .add_plugins(play_revert::plugin)
         .add_plugins(live_frame_view::LiveFrameViewPlugin)
         .add_plugins(live_input::LiveInputPlugin)
         .add_plugins(game_panel::GamePanelPlugin)
-        .add_plugins(live_edits_ui::LiveEditsUiPlugin)
+        .add_plugins(game_panel_header::GamePanelHeaderPlugin)
         .add_plugins(pie_menu::PieMenuPlugin)
         .add_plugins(dock_ops::DockOpsPlugin)
         .add_systems(Startup, (register_workspaces, sync_icon_font))
@@ -572,7 +577,7 @@ impl Plugin for EditorCorePlugin {
             Update,
             EditorInteractionSystems
                 .run_if(in_state(AppState::Editor))
-                .run_if(no_dialog_open.and_then(crate::live_edits_ui::stop_prompt_closed)),
+                .run_if(no_dialog_open),
         )
         .configure_sets(
             PostUpdate,
@@ -629,12 +634,10 @@ impl Plugin for EditorCorePlugin {
                 layout::update_grid_size_label,
                 layout::update_active_document_display,
                 layout::update_tab_strip_highlights,
-                layout::update_pie_view_toggle_appearance,
-                layout::update_pie_view_header_accent,
-                layout::update_save_to_scene_button,
-                layout::update_pie_instance_cycle_button,
-                layout::update_window_mode_button,
-                layout::update_live_badge,
+                layout::update_playing_edge,
+                layout::update_play_controls,
+                layout::theme_transport_text,
+                layout::spin_play_icon,
                 auto_hide_internal_entities,
                 register_animation_entities_in_ast,
                 drop_imported_clip_entities.after(register_animation_entities_in_ast),
@@ -704,6 +707,7 @@ impl Plugin for ExtensionPlugin {
                 .register_extension::<builtin_extensions::ProjectWindowExtension>()
                 .register_extension::<builtin_extensions::GamePanelExtension>()
                 .register_extension::<build_panel::BuildPanelExtension>()
+                .register_extension::<game_output_window::GameOutputExtension>()
                 .register_extension::<builtin_extensions::InspectorExtension>()
                 .register_extension::<test_input::TestInputExtension>();
         }
@@ -1644,7 +1648,6 @@ fn cleanup_editor(world: &mut World) {
     // 5. Reset resources. The catalog, the asset index and the material
     // registry all describe the project being closed.
     world.insert_resource(scene_io::SceneFilePath::default());
-    world.insert_resource(scene_io::SceneDirtyState::default());
     world.insert_resource(Selection::default());
     world.insert_resource(commands::CommandHistory::default());
     world.insert_resource(asset_catalog::AssetCatalog::default());

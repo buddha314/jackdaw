@@ -18,6 +18,7 @@ pub struct UntitledCounter(pub u32);
 pub(crate) fn add_to_extension(ctx: &mut ExtensionContext) {
     ctx.register_operator::<SceneNewOp>()
         .register_operator::<SceneOpenOp>()
+        .register_operator::<SceneExternalChangeOp>()
         .register_operator::<SceneCloseOp>()
         .register_operator::<SceneSwitchOp>()
         .register_operator::<SceneSaveAllOp>()
@@ -239,6 +240,79 @@ pub fn scene_open(In(params): In<OperatorParameters>, mut commands: Commands) ->
     OperatorResult::Finished
 }
 
+#[operator(
+    id = "scene.external_change",
+    leaves_history = true,
+    label = "Answer File Changed on Disk",
+    allows_undo = false,
+    params(
+        answer(
+            String,
+            doc = "keep, to keep what the editor has open and overwrite the files on \
+                   the next save, or reload, to read them from disk."
+        ),
+        path(
+            String,
+            doc = "Scene file the question is about, absolute or relative to the \
+                   project's assets directory. Defaults to the first one waiting."
+        ),
+    )
+)]
+pub fn scene_external_change(
+    In(params): In<OperatorParameters>,
+    world: &mut World,
+) -> OperatorResult {
+    use crate::scenes::external_watch::{
+        ExternalReloadChoice, ExternalSceneChanges, answer_external_change, canonical,
+    };
+    let choice = match params.as_str("answer") {
+        Some("keep") => ExternalReloadChoice::Keep,
+        Some("reload") => ExternalReloadChoice::Reload,
+        other => {
+            warn_caller(
+                world,
+                format!("scene.external_change: answer must be keep or reload, not {other:?}"),
+            );
+            return OperatorResult::Cancelled;
+        }
+    };
+    let path = match params.as_str("path").map(std::path::PathBuf::from) {
+        Some(path) => match resolve_scene_path(world, &path) {
+            Ok(path) => canonical(&path),
+            Err(refusal) => {
+                warn_caller(world, format!("scene.external_change: {refusal}"));
+                return OperatorResult::Cancelled;
+            }
+        },
+        None => {
+            let waiting = world
+                .get_resource::<ExternalSceneChanges>()
+                .and_then(|changes| changes.prompts.first())
+                .map(|prompt| prompt.path.clone());
+            let Some(waiting) = waiting else {
+                warn_caller(world, "scene.external_change: no file change is waiting");
+                return OperatorResult::Cancelled;
+            };
+            waiting
+        }
+    };
+    let asked = world
+        .get_resource::<ExternalSceneChanges>()
+        .is_some_and(|changes| changes.prompts.iter().any(|prompt| prompt.path == path));
+    if !asked {
+        warn_caller(
+            world,
+            format!(
+                "scene.external_change: no change to {} is waiting",
+                path.display()
+            ),
+        );
+        return OperatorResult::Cancelled;
+    }
+    answer_external_change(world, &path, choice);
+    OperatorResult::Finished
+}
+
 /// Where a scene path given by name lands. A relative path names a file under
 /// the project's `assets/`, else under the project root; a new file goes under
 /// `assets/` unless the path already starts with that folder.
@@ -365,7 +439,8 @@ fn reopen_open_tab(world: &mut World, path: &std::path::Path, asked: bool) -> bo
         .path
         .clone()
         .unwrap_or(canonical);
-    let dirty = world.resource::<Scenes>().tabs[index].dirty;
+    let dirty = world.resource::<Scenes>().tabs[index].dirty
+        || crate::scene_io::hooks::has_unsaved_edits(world, index);
     let reread = if dirty {
         if asked {
             warn_caller(
@@ -375,6 +450,7 @@ fn reopen_open_tab(world: &mut World, path: &std::path::Path, asked: bool) -> bo
         }
         false
     } else {
+        crate::scene_io::save_worker::land_saves(world);
         asked || crate::scenes::external_watch::file_has_moved_on(world, &tab_path)
     };
     if !reread {
@@ -445,7 +521,8 @@ pub fn switch_to_open_tab(world: &mut World, canonical: &std::path::Path) -> boo
 /// tab.
 pub struct ReadScene {
     canonical: std::path::PathBuf,
-    file_text: String,
+    /// The bytes the document was read from, as the watcher will read them back.
+    known: Vec<u8>,
     doc: jackdaw_bsn::SceneBsnAst,
     saved_camera: Option<Transform>,
     pending_conversion: Option<crate::jsn_to_bsn::PendingConversion>,
@@ -470,7 +547,9 @@ pub fn read_scene_for_load(world: &mut World, canonical: &std::path::Path) -> Op
 /// memory.
 fn read_scene(world: &mut World, canonical: &std::path::Path) -> Result<ReadScene, String> {
     let _span = info_span!("open.read_scene").entered();
-    let file_text = jackdaw_bsn::read_document_text(canonical)
+    let bytes = std::fs::read(canonical)
+        .map_err(|err| format!("failed to read {}: {err}", canonical.display()))?;
+    let file_text = jackdaw_bsn::document_text_from_bytes(&bytes, canonical)
         .map_err(|err| format!("failed to read {}: {err}", canonical.display()))?;
 
     // A BSN document parses directly. Legacy `.jsn` converts to a `.bsn`
@@ -519,9 +598,14 @@ fn read_scene(world: &mut World, canonical: &std::path::Path) -> Result<ReadScen
     jackdaw_bsn::reject_retired_ui_components(&doc)
         .map_err(|err| format!("cannot open {}: {err}", opened.display()))?;
 
+    // A conversion is written as its text, once it is accepted.
+    let known = match pending_conversion {
+        Some(_) => file_text.into_bytes(),
+        None => bytes,
+    };
     Ok(ReadScene {
         canonical,
-        file_text,
+        known,
         doc,
         saved_camera,
         pending_conversion,
@@ -533,7 +617,7 @@ pub fn open_read_scene(world: &mut World, read: ReadScene) {
     let _span = info_span!("open.read_scene_done").entered();
     let ReadScene {
         canonical,
-        file_text,
+        known,
         mut doc,
         saved_camera,
         pending_conversion,
@@ -554,7 +638,6 @@ pub fn open_read_scene(world: &mut World, read: ReadScene) {
     let dirty = false;
     // Record the bytes before the tab exists: the watcher starts with the tab,
     // and an edit landing in that gap still has to be reported.
-    let known = std::fs::read(&canonical).unwrap_or_else(|_| file_text.clone().into_bytes());
     crate::scenes::external_watch::note_known_content(world, &canonical, &known);
 
     let is_prefab = document_is_prefab(&doc);
@@ -580,6 +663,9 @@ pub fn open_read_scene(world: &mut World, read: ReadScene) {
     tab.path = Some(canonical.clone());
     tab.display_name = display_name;
     tab.dirty = dirty;
+    if dirty {
+        tab.history.forget_saved();
+    }
     // Restore the saved viewport camera framing if the scene file
     // carried one; otherwise leave the default (0, 4, 8) from
     // `new_untitled`.
@@ -640,6 +726,16 @@ pub fn scene_close_system(world: &mut World, target: usize) {
         return;
     }
 
+    // Its save is on the way, and may be what its dirty state is waiting for.
+    let id = world.resource::<Scenes>().tabs[target].id;
+    if crate::scene_io::save_worker::tab_is_being_saved(world, id) {
+        crate::scene_io::save_worker::after_saves(
+            world,
+            crate::scene_io::save_worker::AfterSaves::CloseTab(id),
+        );
+        return;
+    }
+
     let dirty = world.resource::<Scenes>().tabs[target].dirty;
     if dirty {
         // If a dialog is already up, ignore the new request.
@@ -684,6 +780,7 @@ pub fn discard_tab_edits(world: &mut World, target: usize) {
 /// the dialog's Save/Discard branches (after the user has confirmed).
 /// Does not check the dirty flag.
 pub fn scene_close_system_unprompted(world: &mut World, target: usize) {
+    crate::scene_io::save_worker::land_saves(world);
     let tab_count = world.resource::<Scenes>().tabs.len();
     if tab_count <= 1 {
         info!("scene.close: cannot close the last open tab");
@@ -716,7 +813,10 @@ pub fn scene_close_system_unprompted(world: &mut World, target: usize) {
         world.resource_mut::<Scenes>().active = new_target;
         crate::scenes::swap::reactivate_after_close(world, new_target);
     } else {
-        world.resource_mut::<Scenes>().tabs.remove(target);
+        let closed = world.resource_mut::<Scenes>().tabs.remove(target);
+        if let crate::scenes::TabContent::Scene(Some(document)) = closed.content {
+            jackdaw_bsn::drop_document(*document);
+        }
         let mut scenes = world.resource_mut::<Scenes>();
         if scenes.active > target {
             scenes.active -= 1;
@@ -749,13 +849,29 @@ pub fn scene_switch_system(world: &mut World, target: usize) {
     id = "scene.save_all",
     writes_disk = true,
     label = "Save All",
-    allows_undo = false
+    allows_undo = false,
+    invoke = scene_save_all_in_background
 )]
 pub fn scene_save_all(_: In<OperatorParameters>, mut commands: Commands) -> OperatorResult {
     commands.queue(|world: &mut World| {
         scene_save_all_system(world);
     });
     OperatorResult::Finished
+}
+
+fn scene_save_all_in_background(
+    _: In<OperatorParameters>,
+    mut commands: Commands,
+) -> OperatorResult {
+    commands.queue(save_all_in_background);
+    OperatorResult::Finished
+}
+
+/// [`scene_save_all_system`] with the tab in front saved with the main thread free;
+/// what it found goes to whatever [`crate::scene_io::save_worker::after_saves`] holds.
+pub(crate) fn save_all_in_background(world: &mut World) {
+    let with_path = tabs_with_files(world);
+    crate::scene_io::save_worker::save_tabs_front_last(world, &with_path);
 }
 
 /// Iterate tabs, switching to each in turn, serializing tabs with a path
@@ -765,36 +881,26 @@ pub fn scene_save_all(_: In<OperatorParameters>, mut commands: Commands) -> Oper
 /// any authoritative write failure makes the result `false` and leaves that
 /// tab dirty, allowing callers such as quit confirmation to refuse to exit.
 pub fn scene_save_all_system(world: &mut World) -> bool {
-    let mut all_saved = true;
+    let with_path = tabs_with_files(world);
+    let all_saved = !world
+        .resource::<Scenes>()
+        .tabs
+        .iter()
+        .any(|tab| tab.path.is_none() && tab.dirty);
+    save_tabs(world, &with_path).is_empty() && all_saved
+}
+
+/// Every tab with a file, warning of each dirty one without.
+fn tabs_with_files(world: &World) -> Vec<usize> {
     let mut with_path = Vec::new();
     for (i, tab) in world.resource::<Scenes>().tabs.iter().enumerate() {
         if tab.path.is_some() {
             with_path.push(i);
         } else if tab.dirty {
             warn!("scene.save_all: cannot save dirty untitled tab {i} without a path");
-            all_saved = false;
         }
     }
-    save_tabs(world, &with_path).is_empty() && all_saved
-}
-
-/// Save every tab that has a file and unsaved changes, leaving clean and
-/// untitled tabs alone. Returns a message for each tab that did not save.
-pub fn save_modified_scenes(world: &mut World) -> Vec<TabSaveFailure> {
-    let active_modified = active_tab_modified(world);
-    let scenes = world.resource::<Scenes>();
-    let modified: Vec<usize> = scenes
-        .tabs
-        .iter()
-        .enumerate()
-        .filter(|(i, tab)| {
-            tab.path.is_some()
-                && !tab.is_refused()
-                && (tab.dirty || (*i == scenes.active && active_modified))
-        })
-        .map(|(i, _)| i)
-        .collect();
-    save_tabs(world, &modified)
+    with_path
 }
 
 /// Whether the active tab has changes no save has written, counting an edit
@@ -806,10 +912,14 @@ pub fn active_tab_modified(world: &World) -> bool {
     let Some(tab) = scenes.tabs.get(scenes.active) else {
         return false;
     };
-    let depth = world
-        .get_resource::<jackdaw_commands::CommandHistory>()
-        .map_or(0, |history| history.undo_stack.len());
-    tab.dirty || depth > tab.history_depth_at_last_check
+    let Some(history) = world.get_resource::<jackdaw_commands::CommandHistory>() else {
+        return tab.dirty;
+    };
+    match tab.history_state_at_last_check {
+        Some(state) if state == history.state() => tab.dirty,
+        Some(_) => !history.is_saved(),
+        None => tab.dirty || !history.is_saved(),
+    }
 }
 
 /// A tab that did not save.
@@ -822,7 +932,7 @@ pub struct TabSaveFailure {
 
 /// Save the tabs at `indices`, switching to each in turn, then return to the
 /// tab that was active. Returns a failure for each tab that did not save.
-fn save_tabs(world: &mut World, indices: &[usize]) -> Vec<TabSaveFailure> {
+pub(crate) fn save_tabs(world: &mut World, indices: &[usize]) -> Vec<TabSaveFailure> {
     let original_active = world.resource::<Scenes>().active;
     let mut failures = Vec::new();
 
@@ -838,7 +948,7 @@ fn save_tabs(world: &mut World, indices: &[usize]) -> Vec<TabSaveFailure> {
         if i != world.resource::<Scenes>().active && !swap_active_tab(world, i) {
             failures.push(TabSaveFailure {
                 kind: kind.clone(),
-                message: format!("{name} (could not switch to it)"),
+                message: format!("{name} (it is no longer open)"),
             });
             continue;
         }
@@ -908,7 +1018,7 @@ pub fn scene_cycle_next(_: In<OperatorParameters>, mut commands: Commands) -> Op
             return;
         }
         let target = (scenes.active + 1) % count;
-        scene_switch_system(world, target);
+        crate::scenes::ui::request_tab_switch(world, target);
     });
     OperatorResult::Finished
 }
@@ -927,7 +1037,7 @@ pub fn scene_cycle_prev(_: In<OperatorParameters>, mut commands: Commands) -> Op
             return;
         }
         let target = (scenes.active + count - 1) % count;
-        scene_switch_system(world, target);
+        crate::scenes::ui::request_tab_switch(world, target);
     });
     OperatorResult::Finished
 }

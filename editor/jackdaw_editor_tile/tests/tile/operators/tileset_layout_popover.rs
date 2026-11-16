@@ -6,6 +6,7 @@ use crate::operators::tileset_dock::{
 };
 use crate::operators::tileset_edit_ops::{call, entries, on_disk, peers_of, run};
 use crate::operators::tileset_ops::warnings;
+use crate::util::OperatorResultExt as _;
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -13,13 +14,15 @@ use bevy::prelude::*;
 use jackdaw_api::prelude::*;
 use jackdaw_editor_tile::tileset_dock::{DockAction, DockControl, TilesetDockViews};
 use jackdaw_editor_tile::tileset_layout::{
-    CanPaintPreview, GhostMark, LayoutPopover, LayoutTerrainPick, UnsureMark,
+    CanPaintPreview, GhostZones, LayoutPopover, LayoutTerrainPick, UnsureMark,
 };
+use jackdaw_editor_tile::zone_overlay::ZoneOverlay;
 use jackdaw_feathers::combobox::ComboBoxChangeEvent;
 use jackdaw_tilemap::{LayoutTemplate, Placement};
 use jackdaw_tileset::TerrainMatch;
 
 const GRASS: u8 = 1;
+const WATER: u8 = 2;
 const SAND: u8 = 3;
 const GROUND: DockAction =
     DockAction::LayoutPick(LayoutTemplate::Minimal3x3, Placement::BetweenCells);
@@ -100,9 +103,11 @@ fn disabled(app: &mut App, root: Entity, action: DockAction) -> bool {
 }
 
 fn ghosts(app: &mut App, root: Entity) -> BTreeSet<(u32, usize, u8)> {
-    (app.world_mut().query::<&GhostMark>().iter(app.world()))
-        .filter(|g| g.root == root)
-        .map(|g| (g.tile, g.peer, g.terrain))
+    (app.world_mut().query::<(&GhostZones, &ZoneOverlay)>())
+        .iter(app.world())
+        .filter(|(g, _)| g.root == root)
+        .flat_map(|(_, o)| o.values.zones())
+        .map(|(tile, peer, terrain)| (tile, peer, terrain as u8))
         .collect()
 }
 
@@ -148,7 +153,7 @@ fn a_dragged_block_opens_the_popover_with_the_layouts_that_fit_it() {
 }
 
 #[test]
-fn a_3x3_block_asks_ground_or_walls_with_nothing_picked() {
+fn a_3x3_block_asks_ground_or_walls_and_the_sets_drawn_placement_wins() {
     let (mut app, dir) = handmade();
     let (_, root) = opened(&mut app);
     drag_block(&mut app, &dir, root, 3, 3);
@@ -166,6 +171,11 @@ fn a_3x3_block_asks_ground_or_walls_with_nothing_picked() {
         draft_pick(&app),
         Some((LayoutTemplate::Minimal3x3, Placement::OnCells))
     );
+    assert!(
+        disabled(&mut app, root, DockAction::LayoutApply),
+        "the terrains' one set draws between cells elsewhere"
+    );
+    press(&mut app, root, GROUND);
     assert!(!disabled(&mut app, root, DockAction::LayoutApply));
     assert_eq!(popovers(&mut app, root), 1, "a pick keeps the popover open");
 }
@@ -195,7 +205,7 @@ fn the_ghost_marks_are_the_bits_apply_writes() {
 }
 
 #[test]
-fn apply_is_one_undo_entry_and_adds_the_set_in_the_placements_mode() {
+fn apply_is_one_undo_entry_in_the_placements_mode() {
     let (mut app, dir) = handmade();
     call(&mut app, "tileset.terrain.add", &[("name", "sand")]);
     settle(&mut app);
@@ -209,8 +219,13 @@ fn apply_is_one_undo_entry_and_adds_the_set_in_the_placements_mode() {
     assert!(warnings(&app).is_empty(), "{:?}", warnings(&app));
     let after = on_disk(&dir);
     let set = (after.terrain_sets.iter())
-        .find(|s| (s.inner, s.outer) == (SAND, GRASS))
-        .expect("the set is added");
+        .find(|s| s.terrains.contains(&SAND))
+        .expect("sand joins a set");
+    assert_eq!(
+        set.terrains,
+        [GRASS, WATER, SAND],
+        "sand stays where it was added"
+    );
     assert_eq!(set.mode, TerrainMatch::Corners, "ground sits between cells");
     assert_eq!(entries(&app), count + 1, "one undo entry");
     assert_eq!(popovers(&mut app, root), 0, "apply closes the popover");
@@ -224,10 +239,11 @@ fn apply_is_one_undo_entry_and_adds_the_set_in_the_placements_mode() {
     pick_terrain(&mut app, root, true, 1);
     press(&mut app, root, WALLS);
     input(&mut app, "input.key key=Enter");
-    let set = (on_disk(&dir).terrain_sets.into_iter())
-        .find(|s| (s.inner, s.outer) == (SAND, GRASS))
-        .expect("Enter applies");
-    assert_eq!(set.mode, TerrainMatch::CornersAndSides);
+    assert_eq!(
+        on_disk(&dir),
+        before,
+        "walls refused: the terrains' one set draws between cells elsewhere"
+    );
 }
 
 #[test]
@@ -335,23 +351,23 @@ fn an_apply_that_changes_nothing_closes_with_no_stale_ghosts() {
 }
 
 #[test]
-fn switching_tool_or_page_drops_the_draft() {
+fn switching_mode_drops_the_draft() {
     let (mut app, dir) = handmade();
     let (_, root) = opened(&mut app);
     drag_block(&mut app, &dir, root, 3, 3);
-    call(&mut app, "tileset.paint_mode", &[("mode", "paint")]);
+    call(&mut app, "tileset.mode", &[("mode", "terrains")]);
     settle(&mut app);
-    assert!(!has_draft(&app), "paint mode drops it");
+    assert!(!has_draft(&app), "the terrains mode drops it");
     assert_eq!(popovers(&mut app, root), 0);
-    call(&mut app, "tileset.paint_mode", &[("mode", "select")]);
+    call(&mut app, "tileset.mode", &[("mode", "tiles")]);
     settle(&mut app);
     drag_block(&mut app, &dir, root, 3, 3);
     press(
         &mut app,
         root,
-        DockAction::Page(jackdaw_editor_tile::tileset_dock::DockPage::Objects),
+        DockAction::Mode(jackdaw_editor_tile::tileset_modes::ModeId::OBJECTS),
     );
-    assert!(!has_draft(&app), "a page switch drops it");
+    assert!(!has_draft(&app), "the objects mode drops it");
 }
 
 #[test]
@@ -365,11 +381,11 @@ fn an_existing_sets_placement_is_kept_unless_it_draws_nothing_else() {
     assert_eq!(
         draft_pick(&app),
         Some((LayoutTemplate::Minimal3x3, Placement::BetweenCells)),
-        "water over grass already draws between cells"
+        "the set of water and grass already draws between cells"
     );
     press(&mut app, root, WALLS);
     let shown = texts(&mut app, root);
-    let note = "this pair already draws between cells; it has 1 tiles elsewhere";
+    let note = "this terrain set already draws between cells; it has 1 tiles elsewhere";
     assert!(shown.iter().any(|t| t.contains(note)), "{shown:?}");
     assert!(disabled(&mut app, root, DockAction::LayoutApply));
     input(&mut app, "input.key key=Enter");
@@ -402,7 +418,12 @@ fn enter_applies_only_in_the_focused_dock_and_not_while_typing() {
         .resource_mut::<bevy::input_focus::InputFocus>();
     focus.clear();
     assert!(!ready_to_apply(&mut app), "no dock has the keyboard");
-    press(&mut app, root, DockAction::NewTerrain);
+    app.world_mut()
+        .operator("tileset.terrain.from_tile")
+        .call()
+        .expect("dispatches")
+        .assert_finished();
+    settle(&mut app);
     assert!(has_draft(&app));
     assert!(!ready_to_apply(&mut app), "a name field has the keyboard");
 }
@@ -683,4 +704,41 @@ fn clicking_the_picked_layout_again_keeps_hand_placements() {
     let placed = draft(&app).order;
     press(&mut app, root, DockAction::LayoutPick(BLOB.0, BLOB.1));
     assert_eq!(draft(&app).order, placed);
+}
+
+#[test]
+fn the_apply_tooltip_follows_a_rebound_key() {
+    use jackdaw_api_internal::lifecycle::OperatorAction;
+    use jackdaw_feathers::tooltip::Tooltip;
+    use jackdaw_input::{Binding, BindingOf, ModKeys};
+    let (mut app, dir) = handmade();
+    let (_, root) = opened(&mut app);
+    drag_block(&mut app, &dir, root, 3, 3);
+    let actions: Vec<Entity> = app
+        .world_mut()
+        .query::<(Entity, &OperatorAction)>()
+        .iter(app.world())
+        .filter(|(_, a)| a.0 == "tileset.layout.apply")
+        .map(|(e, _)| e)
+        .collect();
+    assert!(!actions.is_empty(), "the apply key has an action");
+    let old: Vec<Entity> = app
+        .world_mut()
+        .query::<(Entity, &BindingOf)>()
+        .iter(app.world())
+        .filter(|(_, b)| actions.contains(&b.0))
+        .map(|(e, _)| e)
+        .collect();
+    for binding in old {
+        app.world_mut().entity_mut(binding).despawn();
+    }
+    let key = Binding::Keyboard {
+        key: KeyCode::KeyQ,
+        mod_keys: ModKeys::empty(),
+    };
+    app.world_mut().spawn((key, BindingOf(actions[0])));
+    settle(&mut app);
+    let apply = control(&mut app, root, DockAction::LayoutApply);
+    let tip = app.world().get::<Tooltip>(apply).map(|t| t.keybind.clone());
+    assert_eq!(tip.as_deref(), Some("Q"));
 }

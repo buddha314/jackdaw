@@ -6,7 +6,8 @@ use bevy::prelude::*;
 use jackdaw::project::{ProjectConfig, ProjectRoot};
 use jackdaw::remote::server::{
     apply_bsn_handler, assets_handler, batch_handler, call_operator_handler, cancel_handler,
-    entity_handler, operators_handler, publish_endpoint, retract_endpoint, scene_tree_handler,
+    entity_handler, game_entities_handler, game_entity_handler, game_output_handler,
+    game_query_handler, operators_handler, publish_endpoint, retract_endpoint, scene_tree_handler,
     screenshot_handler, status_handler, wait_handler,
 };
 use jackdaw_api_internal::operator::OperatorWorldExt as _;
@@ -505,6 +506,52 @@ fn applied_bsn_spawns_every_root_in_the_source() {
     let names = root_names(&mut app);
     assert!(names.contains(&"Barrel".to_string()), "{names:?}");
     assert!(names.contains(&"Sack".to_string()), "{names:?}");
+}
+
+/// The tree lists the roots in the order the outliner shows them, which is
+/// the document's order rather than the order they were spawned in.
+#[test]
+fn the_tree_lists_roots_in_document_order() {
+    let mut app = editor_with_a_scene();
+    call(
+        &mut app,
+        apply_bsn_handler,
+        json!({
+            "source": "#First bevy_transform::components::transform::Transform,\n\
+                #Second bevy_transform::components::transform::Transform,\n\
+                #Third bevy_transform::components::transform::Transform\n",
+        }),
+    );
+    app.update();
+    let ours = |app: &mut App| -> Vec<String> {
+        root_names(app)
+            .into_iter()
+            .filter(|name| ["First", "Second", "Third"].contains(&name.as_str()))
+            .collect()
+    };
+    assert_eq!(ours(&mut app), ["First", "Second", "Third"]);
+
+    call(
+        &mut app,
+        call_operator_handler,
+        json!({ "id": "selection.select", "params": { "name": "Third" } }),
+    );
+    for _ in 0..2 {
+        call(
+            &mut app,
+            call_operator_handler,
+            json!({ "id": "entity.move_up" }),
+        );
+        app.update();
+    }
+
+    assert_eq!(ours(&mut app), ["Third", "First", "Second"]);
+    let tree = call(&mut app, scene_tree_handler, json!({ "depth": 0 }));
+    for node in tree["tree"].as_array().expect("an array") {
+        if node["name"] == json!("Third") {
+            assert!(node["node"].is_u64(), "a root carries its node id: {node}");
+        }
+    }
 }
 
 /// A UI screen hangs off `Node`, which carries `UiTransform` rather than
@@ -1610,6 +1657,204 @@ fn a_pie_wait_answers_on_the_transition_rather_than_the_state_it_started_in() {
     assert_eq!(stopped, json!("stopped"));
 }
 
+/// A wait for a stopped game sent after `pie.stop`, with nothing launched or
+/// building, answers once a launch would have shown up.
+#[test]
+fn a_pie_stopped_wait_with_nothing_launched_answers() {
+    let mut app = util::editor_test_app();
+    let stopped = json!({ "until": "pie_stopped", "request": "after-stop" });
+    let start = app.world().resource::<bevy::diagnostic::FrameCount>().0;
+
+    assert_eq!(
+        poll_pie(&mut app, stopped.clone()).expect("the handler did not refuse"),
+        None
+    );
+    app.world_mut()
+        .resource_mut::<bevy::diagnostic::FrameCount>()
+        .0 = start + 31;
+    let answer = poll_pie(&mut app, stopped)
+        .expect("the handler did not refuse")
+        .expect("nothing is launched, so Play is stopped");
+    assert_eq!(answer["pie"], json!("stopped"));
+}
+
+#[test]
+fn status_follows_play_through_pause_resume_and_stop() {
+    let (mut app, _dir) = editor_with_a_project();
+    let (server, name) = jackdaw_pie_protocol::serve().expect("a rendezvous");
+    let accept = std::thread::spawn(move || server.accept());
+    let _game = jackdaw_pie_protocol::connect(&name).expect("the game connects");
+    let editor_end = accept
+        .join()
+        .expect("accept ran")
+        .expect("the editor accepts");
+    let child = std::process::Command::new("sleep")
+        .arg("600")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a child process");
+    let key = jackdaw::pie::InstanceKey {
+        config: "Game".to_string(),
+        instance: 1,
+    };
+    app.world_mut()
+        .resource_mut::<NextState<jackdaw::AppState>>()
+        .set(jackdaw::AppState::Editor);
+    jackdaw::pie::connect_test_game(app.world_mut(), key, child, editor_end).expect("a link");
+
+    let pie = |app: &mut App| {
+        for _ in 0..3 {
+            app.update();
+        }
+        call(app, status_handler, json!({}))["pie"].clone()
+    };
+    assert_eq!(pie(&mut app), json!("running"));
+
+    let press = |app: &mut App, id: &'static str| {
+        app.world_mut()
+            .operator(id)
+            .call()
+            .expect("the operator dispatches")
+            .assert_finished();
+    };
+    press(&mut app, "pie.pause");
+    assert_eq!(pie(&mut app), json!("paused"));
+    press(&mut app, "pie.pause");
+    assert_eq!(pie(&mut app), json!("running"), "pause again resumes");
+    press(&mut app, "pie.pause");
+    assert_eq!(pie(&mut app), json!("paused"));
+    press(&mut app, "pie.play");
+    assert_eq!(pie(&mut app), json!("running"), "play resumes too");
+    press(&mut app, "pie.stop");
+    assert_eq!(pie(&mut app), json!("stopped"));
+}
+
+/// Status lists each launched game with how far it has got, marks the one the
+/// game methods ask, and drops them once play stops.
+#[test]
+fn status_lists_the_game_instances_play_launched() {
+    let (mut app, _dir) = editor_with_a_project();
+    app.world_mut()
+        .resource_mut::<NextState<jackdaw::AppState>>()
+        .set(jackdaw::AppState::Editor);
+    app.update();
+    assert_eq!(
+        call(&mut app, status_handler, json!({}))["instances"],
+        json!([])
+    );
+
+    let (server, name) = jackdaw_pie_protocol::serve().expect("a rendezvous");
+    let accept = std::thread::spawn(move || server.accept());
+    let _game = jackdaw_pie_protocol::connect(&name).expect("the game connects");
+    let editor_end = accept
+        .join()
+        .expect("accept ran")
+        .expect("the editor accepts");
+    let sleeper = || {
+        std::process::Command::new("sleep")
+            .arg("600")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a child process")
+    };
+    let key = |instance| jackdaw::pie::InstanceKey {
+        config: "Game".to_string(),
+        instance,
+    };
+    jackdaw::pie::connecting_test_game(app.world_mut(), key(2), sleeper());
+    jackdaw::pie::connect_test_game(app.world_mut(), key(1), sleeper(), editor_end)
+        .expect("a link");
+    for _ in 0..3 {
+        app.update();
+    }
+
+    let status = call(&mut app, status_handler, json!({}));
+    assert_eq!(status["pie"], json!("running"), "{status}");
+    assert_eq!(
+        status["instances"],
+        json!([
+            { "config": "Game", "instance": 1, "stage": "connected", "focused": true },
+            { "config": "Game", "instance": 2, "stage": "connecting", "focused": false },
+        ]),
+        "{status}"
+    );
+
+    app.world_mut()
+        .operator("pie.stop")
+        .call()
+        .expect("the operator dispatches")
+        .assert_finished();
+    for _ in 0..3 {
+        app.update();
+    }
+    let status = call(&mut app, status_handler, json!({}));
+    assert_eq!(status["pie"], json!("stopped"), "{status}");
+    assert_eq!(status["instances"], json!([]), "{status}");
+}
+
+/// A game process that is up but has not connected yet reads as building, and a
+/// wait for it to run ends with an error once it exits rather than at the cap.
+#[test]
+fn a_game_still_connecting_reads_building_and_a_wait_on_it_ends_when_it_exits() {
+    let (mut app, _dir) = editor_with_a_project();
+    app.world_mut()
+        .resource_mut::<NextState<jackdaw::AppState>>()
+        .set(jackdaw::AppState::Editor);
+    let child = std::process::Command::new("sh")
+        .args(["-c", "exit 1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a child process");
+    let key = jackdaw::pie::InstanceKey {
+        config: "Game".to_string(),
+        instance: 1,
+    };
+    jackdaw::pie::connecting_test_game(app.world_mut(), key, child);
+    assert_eq!(
+        call(&mut app, status_handler, json!({}))["pie"],
+        json!("building")
+    );
+
+    let running = json!({ "until": "pie_running", "request": "connecting" });
+    assert_eq!(
+        poll_pie(&mut app, running.clone()).expect("the handler did not refuse"),
+        None,
+        "a game still connecting is not running yet"
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while call(&mut app, status_handler, json!({}))["pie"] != json!("stopped") {
+        assert!(
+            std::time::Instant::now() < until,
+            "the exited game was never reaped"
+        );
+        app.update();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let refusal = poll_pie(&mut app, running).expect_err("the game went away");
+    assert!(
+        refusal.message.contains("stopped before it connected"),
+        "{}",
+        refusal.message
+    );
+}
+
+/// A paused game is up, so a wait for a running one answers with `paused`.
+#[test]
+fn a_pie_running_wait_answers_paused_for_a_paused_game() {
+    let mut app = util::editor_test_app();
+    set_play_state(&mut app, jackdaw_api::pie::PlayState::Paused);
+    let answer = poll_pie(
+        &mut app,
+        json!({ "until": "pie_running", "request": "paused" }),
+    )
+    .expect("the handler did not refuse")
+    .expect("a paused game answers a wait for running");
+    assert_eq!(answer, json!({ "pie": "paused" }));
+}
+
 /// A wait that would otherwise hold for its whole frame cap ends when the
 /// frames run out, so a caller is told rather than left on the line.
 #[test]
@@ -2328,4 +2573,242 @@ fn an_abandoned_aim_puts_the_camera_back_only_if_nobody_moved_it() {
     app.world_mut().entity_mut(camera).insert(users);
     expire_pending(&mut app);
     assert_eq!(*app.world().get::<Transform>(camera).unwrap(), users);
+}
+
+/// Run a watching handler once, as one poll of the HTTP layer.
+fn poll_once<M>(
+    app: &mut App,
+    handler: impl bevy::ecs::system::IntoSystem<
+        In<Option<Value>>,
+        bevy::remote::BrpResult<Option<Value>>,
+        M,
+    > + 'static,
+    params: Value,
+) -> bevy::remote::BrpResult<Option<Value>> {
+    app.world_mut()
+        .run_system_cached_with(handler, Some(params))
+        .expect("the handler ran")
+}
+
+#[test]
+fn the_game_methods_refuse_with_no_game_running() {
+    let (mut app, _dir) = editor_with_a_project();
+    for refused in [
+        poll_once(&mut app, game_entities_handler, json!({})),
+        poll_once(&mut app, game_entity_handler, json!({ "node": 7 })),
+        poll_once(
+            &mut app,
+            game_query_handler,
+            json!({ "with": "game::Speed" }),
+        ),
+    ] {
+        let err = refused.expect_err("no game is running");
+        assert!(
+            err.message.contains("no game is running"),
+            "{}",
+            err.message
+        );
+    }
+}
+
+#[test]
+fn the_game_methods_answer_with_what_the_game_replies() {
+    use jackdaw_pie_protocol::event::{from_bytes, to_bytes};
+    use jackdaw_pie_protocol::{
+        ControlEvent, GameEntities, GameEntity, GameEntityRef, GameQuery, PieChannel,
+        PieTransport as _, StateEvent,
+    };
+    use std::time::{Duration, Instant};
+
+    let (mut app, _dir) = editor_with_a_project();
+    let (server, name) = jackdaw_pie_protocol::serve().expect("a rendezvous");
+    let accept = std::thread::spawn(move || server.accept());
+    let mut game_end = jackdaw_pie_protocol::connect(&name).expect("the game connects");
+    let editor_end = accept
+        .join()
+        .expect("accept ran")
+        .expect("the editor accepts");
+    let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .arg("--list")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a child process");
+    let key = jackdaw::pie::InstanceKey {
+        config: "Game".to_string(),
+        instance: 1,
+    };
+    jackdaw::pie::connect_test_game(app.world_mut(), key, child, editor_end).expect("a link");
+
+    let spark = GameEntity {
+        entity: 42,
+        name: Some("Spark".to_string()),
+        parent: None,
+        node: None,
+        components: vec![("game::Speed".to_string(), json!(2.0))],
+        opaque: Vec::new(),
+    };
+    let params = json!({ "entity": 42, "request": "spark" });
+    assert_eq!(
+        poll_once(&mut app, game_entity_handler, params.clone()).expect("asked"),
+        None,
+        "the answer is not in yet"
+    );
+
+    let until = Instant::now() + Duration::from_secs(30);
+    let request = loop {
+        assert!(
+            Instant::now() < until,
+            "the question never reached the game"
+        );
+        if let Some((_, bytes)) = game_end.drain_received().into_iter().next() {
+            match from_bytes::<ControlEvent>(&bytes).expect("a control event") {
+                ControlEvent::Query { request, query } => {
+                    assert_eq!(query, GameQuery::Entity(GameEntityRef::Entity(42)));
+                    break request;
+                }
+                other => panic!("expected the question, got {other:?}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let answer = StateEvent::QueryAnswer {
+        request,
+        answer: Ok(GameEntities {
+            entities: vec![spark.clone()],
+            truncated: false,
+        }),
+    };
+    game_end.send(PieChannel::Reliable, &to_bytes(&answer).expect("encode"));
+
+    let answered = loop {
+        assert!(Instant::now() < until, "the answer never came back");
+        jackdaw::pie::drain_game_events(app.world_mut());
+        if let Some(answered) =
+            poll_once(&mut app, game_entity_handler, params.clone()).expect("an answer")
+        {
+            break answered;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(answered, json!({ "entities": [spark], "truncated": false }));
+
+    assert_eq!(
+        poll_once(&mut app, game_entity_handler, params).expect("the trailing poll"),
+        None
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        game_end.drain_received().is_empty(),
+        "the poll after the answer asks the game nothing"
+    );
+}
+
+/// With no game launched, `jackdaw/game_output` answers with no instance
+/// rather than refusing.
+#[test]
+fn game_output_names_no_instance_before_a_game_runs() {
+    let mut app = util::editor_test_app();
+    let answer = call(&mut app, game_output_handler, json!({}));
+    assert_eq!(answer["instance"], Value::Null, "{answer}");
+    assert_eq!(answer["lines"], json!([]), "{answer}");
+    assert_eq!(answer["running"], json!(false), "{answer}");
+}
+
+/// `jackdaw/game_output` answers with what a running game printed, each line
+/// with its stream and sequence number, and reads on from `since`.
+#[cfg(unix)]
+#[test]
+fn game_output_reads_a_running_games_lines_from_a_sequence_number() {
+    use std::time::{Duration, Instant};
+
+    let mut app = util::editor_test_app();
+    let child = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "echo one; echo two >&2; sleep 1; echo three; sleep 600",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("a child process");
+    let key = jackdaw::pie::InstanceKey {
+        config: "Game".to_string(),
+        instance: 1,
+    };
+    jackdaw::pie::set_connect_timeout(app.world_mut(), Duration::from_secs(600));
+    jackdaw::pie::connecting_test_game(app.world_mut(), key, child);
+
+    let until = Instant::now() + Duration::from_secs(10);
+    let first = loop {
+        let answer = call(&mut app, game_output_handler, json!({ "limit": 2 }));
+        if answer["lines"]
+            .as_array()
+            .is_some_and(|lines| lines.len() == 2)
+        {
+            break answer;
+        }
+        assert!(Instant::now() < until, "the lines never came: {answer}");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(first["instance"]["config"], json!("Game"), "{first}");
+    assert_eq!(first["running"], json!(true), "{first}");
+    let mut lines: Vec<(String, String)> = first["lines"]
+        .as_array()
+        .expect("lines")
+        .iter()
+        .map(|line| {
+            (
+                line["stream"].as_str().unwrap_or_default().to_string(),
+                line["text"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            ("stderr".to_string(), "two".to_string()),
+            ("stdout".to_string(), "one".to_string())
+        ]
+    );
+    let next = first["next"].as_u64().expect("a next sequence number");
+    assert_eq!(next, 2, "{first}");
+
+    let later = loop {
+        let answer = call(
+            &mut app,
+            game_output_handler,
+            json!({ "since": next, "instance": "Game" }),
+        );
+        if !answer["lines"].as_array().is_none_or(Vec::is_empty) {
+            break answer;
+        }
+        assert!(
+            Instant::now() < until,
+            "the third line never came: {answer}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        later["lines"],
+        json!([{ "seq": 2, "stream": "stdout", "text": "three" }]),
+        "{later}"
+    );
+    assert_eq!(later["next"], json!(3), "{later}");
+
+    let stale = call(&mut app, game_output_handler, json!({ "since": 1000 }));
+    assert_eq!(stale["lines"], json!([]), "{stale}");
+    assert_eq!(
+        stale["next"],
+        json!(3),
+        "a stale `since` reads on from the end"
+    );
+    let none = call(&mut app, game_output_handler, json!({ "limit": 0 }));
+    assert_eq!(none["lines"], json!([]), "{none}");
+    assert_eq!(
+        none["next"],
+        json!(0),
+        "no lines read leaves `next` at the oldest"
+    );
 }
