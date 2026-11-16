@@ -13,9 +13,8 @@ use jackdaw_api_internal::operator::warn_caller;
 
 use crate::EditorEntity;
 
+use super::SceneFilePath;
 use super::registration::{register_entities_in_ast, register_entity_in_ast};
-use super::save::save_scene_inner;
-use super::{SceneDirtyState, SceneFilePath};
 
 pub(crate) fn prefab_cache_epoch(world: &World) -> Option<u64> {
     world
@@ -131,6 +130,7 @@ pub fn load_scene_from_file_with_outcome(
 
 fn finish_load_scene(world: &mut World, chosen: &std::path::Path) -> LoadOutcome {
     let _span = info_span!("open.finish_load").entered();
+    super::save_worker::land_saves(world);
     let mut path = chosen.to_string_lossy().to_string();
 
     let bytes = match std::fs::read(&path) {
@@ -322,7 +322,16 @@ fn finish_load_scene(world: &mut World, chosen: &std::path::Path) -> LoadOutcome
             let cache = world.resource::<crate::prefab::PrefabAstCache>();
             let get_prefab = |p: &Path| cache.get(p);
             match crate::prefab::resolver_bsn::resolve_scene(&authored, &get_prefab) {
-                Ok(resolved) => Some(resolved),
+                Ok(mut resolved) => {
+                    if !crate::scenes::operators::document_is_prefab(&authored) {
+                        let registry = world.resource::<AppTypeRegistry>().clone();
+                        crate::scene_nodes::separate_from_inherited_ids(
+                            &mut resolved,
+                            &registry.read(),
+                        );
+                    }
+                    Some(resolved)
+                }
                 Err(e) => {
                     warn!("prefab resolution failed: {e}; spawning unresolved scene");
                     None
@@ -441,8 +450,9 @@ fn finish_load_scene(world: &mut World, chosen: &std::path::Path) -> LoadOutcome
     // content, and every placement then resolves against that box.
     crate::ui_palette::backfill_ui_root_size(world);
 
-    // Stacks were cleared by clear_scene_entities, so dirty baseline is 0
-    world.resource_mut::<SceneDirtyState>().undo_len_at_save = 0;
+    world
+        .resource_mut::<jackdaw_commands::CommandHistory>()
+        .mark_current_saved();
     if let Some(upgrade) = pending_upgrade {
         crate::lod_upgrade::finish_upgrade(world, upgrade);
     }
@@ -506,13 +516,11 @@ pub fn declared_scene_kind(ast: &jackdaw_bsn::SceneBsnAst) -> crate::scenes::ope
 pub enum SidecarImport {
     /// Disk wins. Used when the user explicitly loads or reloads a scene.
     Reload,
-    /// Only fill paths the store has never heard of. Used on tab
-    /// activation, where the store may be holding unsaved sculpting that
-    /// the file on disk does not have yet.
+    /// Only fill paths the store has never heard of.
     FillMissing,
-    /// Fill paths the store has never heard of, and re-read the ones whose
-    /// file has been written since the store last read it. Used when returning
-    /// to a tab with nothing unsaved in it.
+    /// Fill paths the store has never heard of, and re-read the ones holding
+    /// no unsaved edits whose file has been written since the store last read
+    /// it. Used on tab activation.
     RefreshChanged,
 }
 
@@ -627,9 +635,9 @@ fn forget_drag_resource<R: Resource<Mutability = bevy::ecs::component::Mutable> 
 /// Remove scene entities from the world (named non-editor entities + their descendants).
 pub(crate) fn clear_scene_entities(world: &mut World) {
     let _span = info_span!("scene.clear").entered();
-    if world.contains_resource::<jackdaw_bsn::SceneBsnAst>() {
-        info_span!("doc.drop")
-            .in_scope(|| world.insert_resource(jackdaw_bsn::SceneBsnAst::default()));
+    super::save_worker::land_saves(world);
+    if let Some(mut live) = world.get_resource_mut::<jackdaw_bsn::SceneBsnAst>() {
+        jackdaw_bsn::drop_document(std::mem::take(&mut *live));
     }
 
     // Extensions' per-scene state belongs to the scene being cleared, not to the tab it was
@@ -784,13 +792,7 @@ pub(super) fn poll_scene_dialog(world: &mut World) {
                     &path,
                 );
 
-                match save_scene_inner(world) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        error!("scene save (after Save As dialog) failed: {err}");
-                        crate::status_bar::notify_error(world, format!("Not saved: {err}"));
-                    }
-                }
+                super::save_worker::save_active_tab_in_background(world);
             }
         }
     }

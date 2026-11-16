@@ -4334,7 +4334,6 @@ dependencies = [
  "bevy_reflect",
  "jackdaw_bind",
  "log",
- "nom",
  "path-slash",
  "pathdiff",
  "serde",
@@ -5051,6 +5050,7 @@ version = "0.21.0-dev"
 dependencies = [
  "bevy",
  "image",
+ "jackdaw_bsn",
  "jackdaw_tilemap",
 ]
 

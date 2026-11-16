@@ -71,6 +71,11 @@ pub struct PendingNodeChanges {
 }
 
 impl PendingNodeChanges {
+    /// Drop what is held for `node`: text newer than it is on its way.
+    pub(crate) fn forget(&mut self, node: u64) {
+        self.nodes.remove(&node);
+    }
+
     /// Whether a change for `node` is held.
     pub fn contains(&self, node: u64) -> bool {
         self.nodes.contains_key(&node)
@@ -145,9 +150,15 @@ pub fn install_node_index(app: &mut App) {
     app.init_resource::<PendingNodeChanges>();
     app.add_observer(index_node_insert);
     app.add_observer(index_node_replace);
+    app.init_resource::<crate::node_structure::HeldStructure>();
     app.add_systems(
         Update,
-        apply_pending_node_changes.after(crate::spawn_loaded_scenes),
+        (
+            crate::node_structure::replay_held_structure,
+            apply_pending_node_changes,
+        )
+            .chain()
+            .after(crate::spawn_loaded_scenes),
     );
     let world = app.world_mut();
     let present: Vec<(Entity, SceneNodeId)> = world
@@ -545,30 +556,67 @@ pub fn apply_node_components(
     }
 }
 
+/// The digest of the definition each `#Name` last loaded from the editor.
+#[derive(Resource, Default)]
+struct EditorDefinitions(HashMap<String, u64>);
+
 /// Load the named asset definitions in `text` into their asset stores and
 /// [`BsnSceneAssets`], under both reference spellings. A name that already answers
 /// to a live asset of its type has the definition written into that asset, so
-/// every entity holding it updates.
+/// every entity holding it updates. A definition the name last loaded leaves the
+/// asset alone, with whatever the game has done to it since.
 pub fn load_scene_assets(world: &mut World, text: &str) {
+    match jackdaw_bsn::parse_bsn_text(text) {
+        Ok(mut ast) => load_document_assets(world, &mut ast),
+        Err(err) => warn!("PIE: could not read the asset definitions the editor sent: {err}"),
+    }
+}
+
+/// [`load_scene_assets`] for a document already read, which is left as it was.
+pub(crate) fn load_document_assets(world: &mut World, ast: &mut jackdaw_bsn::SceneBsnAst) {
     let held = world
         .get_resource::<BsnSceneAssets>()
         .map(|assets| assets.0.clone())
         .unwrap_or_default();
-    let entries =
-        match load_with_textures(world, text, |name| held.get(&format!("#{name}")).cloned()) {
-            Ok(entries) => entries,
-            Err(err) => {
-                warn!("PIE: could not read the asset definitions the editor sent: {err}");
-                return;
-            }
+    let mut loaded = world
+        .remove_resource::<EditorDefinitions>()
+        .unwrap_or_default();
+    let mut changed = HashMap::new();
+    let mut unchanged = Vec::new();
+    for &root in &ast.roots {
+        let Some((reference, digest)) = definition_of(ast, root) else {
+            continue;
         };
+        if held.contains_key(&reference) && loaded.0.get(&reference) == Some(&digest) {
+            unchanged.push(root);
+        } else {
+            changed.insert(reference, digest);
+        }
+    }
+    let roots = ast.roots.clone();
+    ast.roots.retain(|root| !unchanged.contains(root));
+    let entries = load_with_textures(world, ast, |name| held.get(&format!("#{name}")).cloned());
+    ast.roots = roots;
     let mut assets = world.get_resource_or_init::<BsnSceneAssets>();
     for entry in entries {
-        assets
-            .0
-            .insert(format!("#{}", entry.name), entry.handle.clone());
+        let reference = format!("#{}", entry.name);
+        if let Some(digest) = changed.remove(&reference) {
+            loaded.0.insert(reference.clone(), digest);
+        }
+        assets.0.insert(reference, entry.handle.clone());
         assets.0.insert(format!("@{}", entry.name), entry.handle);
     }
+    world.insert_resource(loaded);
+}
+
+/// The `#Name` of the asset root `root` and a digest of what it defines.
+fn definition_of(ast: &jackdaw_bsn::SceneBsnAst, root: Entity) -> Option<(String, u64)> {
+    use std::hash::{Hash, Hasher};
+    let name = ast.get_name(root)?;
+    let (type_path, value) = jackdaw_bsn::asset_value_from_root(ast, root)?;
+    let mut hasher = std::hash::DefaultHasher::new();
+    (type_path, jackdaw_bsn::emit_value_text(&value)).hash(&mut hasher);
+    Some((format!("#{name}"), hasher.finish()))
 }
 
 /// Load each asset file the editor sent, as `(path, text)`, into
@@ -579,8 +627,9 @@ pub fn load_asset_files(world: &mut World, files: &[(String, String)]) {
         let held = world
             .get_resource::<JackdawCatalog>()
             .and_then(|catalog| catalog.files.get(path).cloned());
-        match load_with_textures(world, text, |_| held.clone()) {
-            Ok(entries) => {
+        match jackdaw_bsn::parse_bsn_text(text) {
+            Ok(ast) => {
+                let entries = load_with_textures(world, &ast, |_| held.clone());
                 let (Some(entry), Some(mut catalog)) = (
                     entries.into_iter().next(),
                     world.get_resource_mut::<JackdawCatalog>(),
@@ -588,7 +637,11 @@ pub fn load_asset_files(world: &mut World, files: &[(String, String)]) {
                     warn!("PIE: the editor sent no asset this game can hold for {path}");
                     continue;
                 };
-                catalog.files.insert(path.clone(), entry.handle);
+                catalog.files.insert(path.clone(), entry.handle.clone());
+                world
+                    .get_resource_or_init::<BsnSceneAssets>()
+                    .0
+                    .insert(path.clone(), entry.handle);
             }
             Err(err) => warn!("PIE: could not read the asset file {path} the editor sent: {err}"),
         }
@@ -599,14 +652,12 @@ pub fn load_asset_files(world: &mut World, files: &[(String, String)]) {
 /// space, ahead of the generic resolve reaching the same path.
 fn load_with_textures(
     world: &mut World,
-    text: &str,
+    ast: &jackdaw_bsn::SceneBsnAst,
     held: impl Fn(&str) -> Option<UntypedHandle>,
-) -> Result<Vec<jackdaw_bsn::CatalogEntry>, jackdaw_bsn::BsnLoadError> {
+) -> Vec<jackdaw_bsn::CatalogEntry> {
     #[cfg(feature = "render")]
-    let _preloaded_textures = jackdaw_bsn::parse_bsn_text(text)
-        .map(|ast| crate::preload_textures(world, &ast))
-        .unwrap_or_default();
-    jackdaw_bsn::load_bsn_assets_onto(world, text, held)
+    let _preloaded_textures = crate::preload_textures(world, ast);
+    jackdaw_bsn::load_document_assets_onto(world, ast, held)
 }
 
 /// Write a node's change to `entities`. Returns the types whose value named an

@@ -1835,11 +1835,17 @@ fn spawn_color_field(
     let path = field_path;
 
     let commit = move |world: &mut World, rgba: [f32; 4], is_final: bool| {
+        let new_json = srgba_json(world, rgba);
         if is_final {
-            apply_color_with_undo(world, source_entity, &tp, &path, rgba);
+            crate::commands::field_edit_commit(
+                world,
+                &tp,
+                &path,
+                &new_json,
+                "Set color on multiple entities",
+            );
         } else {
-            let value_str = serde_json::to_string(&rgba).unwrap_or_default();
-            apply_field_value_live(world, source_entity, &tp, &path, &value_str);
+            crate::commands::field_edit_preview(world, &tp, &path, &new_json);
         }
     };
 
@@ -2033,8 +2039,37 @@ fn commit_color_field(world: &mut World, root: Entity, is_final: bool) {
     let Some(commit) = world.entity_mut(root).take::<ColorCommit>() else {
         return;
     };
+    if is_final {
+        world.entity_mut(root).remove::<ColorDragOpen>();
+    } else {
+        world.entity_mut(root).insert(ColorDragOpen);
+    }
     commit.0(world, rgba, is_final);
     world.entity_mut(root).insert(commit);
+}
+
+/// On a colour field root while a drag on it has ticked without a release.
+#[derive(Component)]
+pub(crate) struct ColorDragOpen;
+
+/// A press on a colour slider or plane that never becomes a drag sends no
+/// release, nor does a cancelled touch. Once no pointer is held, settle what
+/// such a gesture left as a release.
+pub(crate) fn settle_released_color_drags(
+    pointers: Query<&bevy::picking::pointer::PointerPressState>,
+    open: Query<Entity, With<ColorDragOpen>>,
+    mut commands: Commands,
+) {
+    if open.is_empty()
+        || pointers
+            .iter()
+            .any(bevy::picking::pointer::PointerPressState::is_any_pressed)
+    {
+        return;
+    }
+    for root in &open {
+        commands.queue(move |world: &mut World| commit_color_field(world, root, true));
+    }
 }
 
 /// Write path for the red/blue color plane. Updates the red and blue channels
@@ -2099,44 +2134,12 @@ pub(crate) fn on_color_slider_change(
     });
 }
 
-/// Apply a color change with undo support (propagates to all selected entities).
-fn apply_color_with_undo(
-    world: &mut World,
-    _entity: Entity,
-    type_path: &str,
-    field_path: &str,
-    new_rgba: [f32; 4],
-) {
-    let registry = world.resource::<AppTypeRegistry>().clone();
-
-    // Live edits need the color in canonical reflect form (a `Color`
-    // enum like `{"LinearRgba": {..}}`), not the picker's raw sRGBA
-    // array, so the game can deserialize the full component.
-    if *world.resource::<crate::pie_mirror::PieViewMode>() == crate::pie_mirror::PieViewMode::Live {
-        let srgba = Srgba::new(new_rgba[0], new_rgba[1], new_rgba[2], new_rgba[3]);
-        let canonical = {
-            let reg = registry.read();
-            color_to_canonical_json(Color::Srgba(srgba), &reg)
-        };
-        try_route_pie_live_field_edit(world, _entity, type_path, field_path, canonical);
-        return;
-    }
-
-    // The canonical reflect JSON (`{"Srgba": {..}}`) deserializes into any
-    // `Color`-typed field; the picker's raw sRGBA array does not.
-    let srgba = Srgba::new(new_rgba[0], new_rgba[1], new_rgba[2], new_rgba[3]);
-    let new_json = {
-        let reg = registry.read();
-        color_to_canonical_json(Color::Srgba(srgba), &reg)
-    };
-
-    crate::commands::field_edit_commit(
-        world,
-        type_path,
-        field_path,
-        &new_json,
-        "Set color on multiple entities",
-    );
+/// The picker's sRGBA as canonical reflect JSON (`{"Srgba": {..}}`), which
+/// deserializes into any `Color`-typed field where the raw array does not.
+fn srgba_json(world: &World, rgba: [f32; 4]) -> serde_json::Value {
+    let srgba = Srgba::new(rgba[0], rgba[1], rgba[2], rgba[3]);
+    let registry = world.resource::<AppTypeRegistry>().read();
+    color_to_canonical_json(Color::Srgba(srgba), &registry)
 }
 
 /// The same number field in the shared label-left row shape, for cards that lay
@@ -2309,91 +2312,9 @@ fn spawn_editable_field(
     );
 }
 
-/// When the inspector is in PIE Live mode, apply a field edit to the selected
-/// preview entity immediately (so the viewport reflects the change) and stream
-/// a `SetComponent` to the focused running game instance. Returns `true` when
-/// handled as a live edit so the caller skips the authored `SetBsnField` path.
-///
-/// The preview entity IS the normal `Selection` entity in Live mode (the
-/// projection has already applied the live overlay to it). A reverse-lookup
-/// through `PieProjection.by_bits` finds which game-side bits to address.
-pub(crate) fn try_route_pie_live_field_edit(
-    world: &mut World,
-    source_entity: Entity,
-    type_path: &str,
-    field_path: &str,
-    field_value: serde_json::Value,
-) -> bool {
-    use crate::pie_mirror::PieViewMode;
-    use jackdaw_pie_protocol::ControlEvent;
-
-    if *world.resource::<PieViewMode>() != PieViewMode::Live {
-        return false;
-    }
-
-    // Find the game-entity bits that correspond to this preview entity.
-    let bits = crate::live_edits::live_bits_for_preview(
-        world.resource::<crate::pie_projection::PieProjection>(),
-        source_entity,
-    );
-    let Some(bits) = bits else {
-        // Not a projected live entity; fall through to the authored path.
-        return false;
-    };
-
-    // Read the full component value from the preview entity via reflection,
-    // then merge the edited field into it so the game receives a complete
-    // canonical component JSON.
-    let registry = world.resource::<AppTypeRegistry>().clone();
-    let mut full_value =
-        crate::live_edits::serialize_component_json(world, source_entity, type_path);
-
-    // Log the field as it lands in the merged component (post-normalization),
-    // not the raw inspector input; fall back to the input when the field
-    // cannot be extracted back out.
-    let field_value_for_log;
-    {
-        let reg = registry.read();
-        let raw = field_value.clone();
-        crate::component_json::set_field_in_component_json(
-            &mut full_value,
-            type_path,
-            field_path,
-            field_value,
-            &reg,
-        );
-        field_value_for_log = crate::component_json::get_field_in_component_json(
-            &full_value,
-            type_path,
-            field_path,
-            &reg,
-        )
-        .cloned()
-        .unwrap_or(raw);
-    }
-
-    crate::pie::send_control_to_focused(
-        world,
-        ControlEvent::SetComponent {
-            entity: bits,
-            type_path: type_path.to_string(),
-            value: full_value,
-        },
-    );
-    crate::live_edits::record_live_edit(
-        world,
-        source_entity,
-        bits,
-        type_path,
-        field_path,
-        field_value_for_log,
-    );
-    true
-}
-
 /// Serialize a `Color` to its canonical reflect JSON (e.g.
-/// `{"LinearRgba": {..}}`) so a live color edit round-trips through the
-/// game's full-component deserializer. Falls back to the raw sRGBA array
+/// `{"LinearRgba": {..}}`), which deserializes into any `Color`-typed field.
+/// Falls back to the raw sRGBA array
 /// when `Color` is not registered.
 fn color_to_canonical_json(
     color: Color,
@@ -2411,15 +2332,10 @@ fn color_to_canonical_json(
 /// ([`crate::commands::field_edit_commit`]). Propagates to the current selection.
 fn apply_field_json_with_undo(
     world: &mut World,
-    entity: Entity,
     type_path: &str,
     field_path: &str,
     new_json: serde_json::Value,
 ) {
-    if try_route_pie_live_field_edit(world, entity, type_path, field_path, new_json.clone()) {
-        return;
-    }
-
     crate::commands::field_edit_commit(
         world,
         type_path,
@@ -2897,36 +2813,19 @@ pub(crate) fn on_text_edit_commit(
 
     let value_str = event.value.clone();
     commands.queue(move |world: &mut World| {
-        apply_field_json_with_undo(
-            world,
-            source_entity,
-            &tp,
-            &path,
-            serde_json::Value::String(value_str),
-        );
+        apply_field_json_with_undo(world, &tp, &path, serde_json::Value::String(value_str));
     });
 }
 
 /// Apply a drag-tick (non-final) numeric edit via [`crate::commands::field_edit_preview`].
-/// Live ECS only, no document write or minting of undo. In PIE Live mode it routes
-/// through the live-edit stream instead.
+/// Live ECS only, no document write or minting of undo.
 fn apply_field_value_live(
     world: &mut World,
-    source_entity: Entity,
     type_path: &str,
     field_path: &str,
     new_value_str: &str,
 ) {
     let new_json = parse_to_json_value(new_value_str);
-    if try_route_pie_live_field_edit(
-        world,
-        source_entity,
-        type_path,
-        field_path,
-        new_json.clone(),
-    ) {
-        return;
-    }
     crate::commands::field_edit_preview(world, type_path, field_path, &new_json);
 }
 
@@ -2970,9 +2869,9 @@ pub(crate) fn on_numeric_value_change_f64(
         };
         let value_str = format!("{stored}");
         if is_final {
-            apply_field_json_with_undo(world, target, &tp, &path, parse_to_json_value(&value_str));
+            apply_field_json_with_undo(world, &tp, &path, parse_to_json_value(&value_str));
         } else {
-            apply_field_value_live(world, target, &tp, &path, &value_str);
+            apply_field_value_live(world, &tp, &path, &value_str);
         }
     });
 }
@@ -3059,9 +2958,9 @@ pub(crate) fn on_numeric_value_change_i64(
     let value_str = format!("{value}");
     commands.queue(move |world: &mut World| {
         if is_final {
-            apply_field_json_with_undo(world, target, &tp, &path, serde_json::json!(value));
+            apply_field_json_with_undo(world, &tp, &path, serde_json::json!(value));
         } else {
-            apply_field_value_live(world, target, &tp, &path, &value_str);
+            apply_field_value_live(world, &tp, &path, &value_str);
         }
     });
 }
@@ -3091,7 +2990,7 @@ pub(crate) fn on_checkbox_commit(
     // the box renders the change. Feathers styles the box off `Checked`.
     jackdaw_feathers::utils::set_marker_if_alive::<Checked>(&mut commands, target, checked);
     commands.queue(move |world: &mut World| {
-        apply_field_json_with_undo(world, source, &tp, &path, serde_json::json!(checked));
+        apply_field_json_with_undo(world, &tp, &path, serde_json::json!(checked));
     });
 }
 
@@ -3715,7 +3614,7 @@ pub(super) fn spawn_enum_menu(
                 let path = path.clone();
                 let tp = tp.clone();
                 commands.queue(move |world: &mut World| {
-                    apply_enum_variant_with_undo(world, source_entity, &tp, &path, &variant);
+                    apply_enum_variant_with_undo(world, &tp, &path, &variant);
                 });
             },
         );
@@ -3861,7 +3760,6 @@ pub(super) fn spawn_variant_contents(
 /// Apply an enum variant change with undo support.
 pub(super) fn apply_enum_variant_with_undo(
     world: &mut World,
-    _entity: Entity,
     type_path: &str,
     field_path: &str,
     variant_name: &str,
@@ -3880,10 +3778,6 @@ pub(super) fn apply_enum_variant_with_undo(
     let new_json = registered
         .or_else(|| schema_variant_json(world, type_path, field_path, variant_name))
         .unwrap_or_else(|| serde_json::Value::String(variant_name.to_string()));
-
-    if try_route_pie_live_field_edit(world, _entity, type_path, field_path, new_json.clone()) {
-        return;
-    }
 
     crate::commands::field_edit_commit(
         world,

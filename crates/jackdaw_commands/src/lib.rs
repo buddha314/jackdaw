@@ -94,6 +94,20 @@ pub struct CommandHistory {
     /// Which state of the document the history last left, drawn from one
     /// process-wide counter so no two histories ever share a value.
     revision: u64,
+    /// The states of the document along this history, oldest first, each named
+    /// by a value no other state has. Undo and redo move along it, and an edit
+    /// after an undo cuts off what lay ahead.
+    states: Vec<u64>,
+    /// Where in `states` the document is.
+    at: usize,
+    /// The state the document's file holds, if it is still on this history.
+    saved: Option<u64>,
+    /// How many entries the budget has dropped from the bottom of the undo
+    /// stack, so an entry's depth stays the same as entries below it go.
+    trimmed: usize,
+    /// The place [`return_to_mark`](Self::return_to_mark) comes back to, while
+    /// one is held.
+    held: Option<HeldMark>,
 }
 
 /// The source of every [`CommandHistory::revision`].
@@ -103,6 +117,36 @@ fn next_revision() -> u64 {
     NEXT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A place on a history and the way back to it.
+///
+/// The way back is the line of undo entries down to `depth`, then `path`
+/// redone in order. An edit made after undoing below the mark would discard
+/// the redo entries leading back up to it; while a mark is held they move
+/// into `path` instead.
+struct HeldMark {
+    /// The state the history was at.
+    state: u64,
+    /// Every state made after the mark has a value at least this.
+    since: u64,
+    /// The states up to and including the mark's.
+    states: Vec<u64>,
+    /// How many undo entries, counting trimmed ones, lie below where the way
+    /// back leaves the line the history is on.
+    depth: usize,
+    /// The entries to redo from `depth` to reach the mark, oldest first.
+    path: Vec<Box<dyn EditorCommand>>,
+}
+
+/// What [`CommandHistory::return_to_mark`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Returned {
+    /// The first reason an entry whose target is gone was dropped on the way.
+    pub dropped: Option<String>,
+    /// Whether the history reached the mark. It falls short when the budget
+    /// has dropped entries it needed.
+    pub reached: bool,
+}
+
 /// Where the undo stack stood when a span was opened. Hand it back to
 /// [`CommandHistory::end_span`] to collapse everything pushed since.
 #[derive(Debug, Clone, Copy)]
@@ -110,12 +154,18 @@ pub struct HistorySpan(u64);
 
 impl Default for CommandHistory {
     fn default() -> Self {
+        let state = next_revision();
         Self {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             budget_bytes: HISTORY_BUDGET_BYTES,
             pushes: 0,
             revision: next_revision(),
+            states: vec![state],
+            at: 0,
+            saved: Some(state),
+            trimmed: 0,
+            held: None,
         }
     }
 }
@@ -123,11 +173,47 @@ impl Default for CommandHistory {
 impl CommandHistory {
     pub fn execute(&mut self, mut command: Box<dyn EditorCommand>, world: &mut World) {
         command.execute(world);
+        self.keep_way_back();
         self.undo_stack.push(command);
         self.pushes += 1;
         self.revision = next_revision();
+        self.enter_new_state();
         self.redo_stack.clear();
         self.trim_to_budget();
+    }
+
+    fn enter_new_state(&mut self) {
+        self.states.truncate(self.at + 1);
+        self.states.push(next_revision());
+        self.at = self.states.len() - 1;
+    }
+
+    /// Which state of the document the history is at. Unlike
+    /// [`revision`](Self::revision), an undo back to a state gives the value that
+    /// state had.
+    pub fn state(&self) -> u64 {
+        self.states[self.at]
+    }
+
+    /// Record `state`, from [`state`](Self::state), as what the document's file
+    /// holds.
+    pub fn mark_saved(&mut self, state: u64) {
+        self.saved = Some(state);
+    }
+
+    /// Record the state the history is at as what the document's file holds.
+    pub fn mark_current_saved(&mut self) {
+        self.saved = Some(self.state());
+    }
+
+    /// Record that no state on this history is what the document's file holds.
+    pub fn forget_saved(&mut self) {
+        self.saved = None;
+    }
+
+    /// Whether the document is in the state its file holds.
+    pub fn is_saved(&self) -> bool {
+        self.saved == Some(self.state())
     }
 
     /// Which state of the document this history last left. It rises on every
@@ -136,11 +222,166 @@ impl CommandHistory {
         self.revision
     }
 
-    /// Forget both stacks, as opening another scene does.
+    /// How many undo entries lie below the document, counting the ones the
+    /// budget has dropped.
+    fn depth(&self) -> usize {
+        self.trimmed + self.undo_stack.len()
+    }
+
+    /// Hold the place the history is at now, unless one is already held.
+    pub fn hold_mark(&mut self) {
+        if self.held.is_some() {
+            return;
+        }
+        self.held = Some(HeldMark {
+            state: self.state(),
+            since: NEXT_REVISION.load(std::sync::atomic::Ordering::Relaxed),
+            states: self.states[..=self.at].to_vec(),
+            depth: self.depth(),
+            path: Vec::new(),
+        });
+    }
+
+    /// Let go of the held mark.
+    pub fn release_mark(&mut self) {
+        self.held = None;
+    }
+
+    /// Whether a mark is held.
+    pub fn holds_mark(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// The state the held mark is at, if one is held.
+    pub fn mark_state(&self) -> Option<u64> {
+        self.held.as_ref().map(|held| held.state)
+    }
+
+    /// A mark at the oldest state on the history, with nothing below it.
+    fn origin(&self) -> HeldMark {
+        let state = self.states[0];
+        HeldMark {
+            state,
+            since: state + 1,
+            states: vec![state],
+            depth: 0,
+            path: Vec::new(),
+        }
+    }
+
+    /// Whether the history has moved off the held mark, or off its oldest state
+    /// when none is held.
+    pub fn left_mark(&self) -> bool {
+        let origin;
+        let held = match &self.held {
+            Some(held) => held,
+            None => {
+                origin = self.origin();
+                &origin
+            }
+        };
+        self.state() != held.state
+            || !held.path.is_empty()
+            || self.states.iter().any(|state| *state >= held.since)
+    }
+
+    /// Before an edit discards the redo stack, move the entries that lead back
+    /// up to the held mark onto its way back.
+    fn keep_way_back(&mut self) {
+        let depth = self.depth();
+        let Some(held) = self.held.as_mut() else {
+            return;
+        };
+        if held.depth <= depth {
+            return;
+        }
+        let take = (held.depth - depth).min(self.redo_stack.len());
+        let at = self.redo_stack.len() - take;
+        let mut leading = self.redo_stack.split_off(at);
+        leading.reverse();
+        leading.append(&mut held.path);
+        held.path = leading;
+        held.depth = depth;
+    }
+
+    /// Undo and redo back to the held mark, or to the oldest state on the
+    /// history when none is held, and let go of it. When anything was done
+    /// since the mark, every state made since is forgotten, so no redo reaches
+    /// one.
+    pub fn return_to_mark(&mut self, world: &mut World) -> Returned {
+        let held = self.held.take().unwrap_or_else(|| self.origin());
+        let edited = !held.path.is_empty() || self.states.iter().any(|state| *state >= held.since);
+        let mut returned = Returned {
+            dropped: None,
+            reached: true,
+        };
+        while self.depth() > held.depth {
+            let Some(mut command) = self.undo_stack.pop() else {
+                break;
+            };
+            if let Some(why) = command.gone(world) {
+                returned.dropped.get_or_insert(why);
+                continue;
+            }
+            command.undo(world);
+            if !edited {
+                self.redo_stack.push(command);
+            }
+        }
+        if self.depth() > held.depth {
+            returned.reached = false;
+        }
+        let below = held.depth.saturating_sub(self.depth());
+        for _ in 0..below {
+            let Some(mut command) = self.redo_stack.pop() else {
+                returned.reached = false;
+                break;
+            };
+            if let Some(why) = command.gone(world) {
+                returned.dropped.get_or_insert(why);
+                continue;
+            }
+            command.execute(world);
+            self.undo_stack.push(command);
+        }
+        if returned.reached {
+            for mut command in held.path {
+                if let Some(why) = command.gone(world) {
+                    returned.dropped.get_or_insert(why);
+                    continue;
+                }
+                command.execute(world);
+                self.undo_stack.push(command);
+            }
+        }
+        self.revision = next_revision();
+        if edited {
+            self.redo_stack.clear();
+            if returned.reached {
+                self.states = held.states;
+                self.at = self.states.len() - 1;
+            } else {
+                self.enter_new_state();
+            }
+        } else if let Some(at) = self.states.iter().position(|state| *state == held.state) {
+            self.at = at;
+        }
+        returned
+    }
+
+    /// Forget both stacks, as opening another scene does. The document stays as
+    /// saved, or as unsaved, as it was.
     pub fn clear(&mut self) {
+        let was_saved = self.is_saved();
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.revision = next_revision();
+        let state = next_revision();
+        self.states = vec![state];
+        self.at = 0;
+        self.saved = was_saved.then_some(state);
+        self.trimmed = 0;
+        self.held = None;
     }
 
     /// Start collecting entries for one undo entry. Spans nest: an inner
@@ -162,7 +403,10 @@ impl CommandHistory {
             }
             // One entry is already one entry; wrapping it would only bury
             // the description the user reads in the undo menu.
-            1 => self.undo_stack.push(pushed.remove(0)),
+            1 => {
+                self.undo_stack.push(pushed.remove(0));
+                self.at = (self.at + 1).min(self.states.len() - 1);
+            }
             _ => self.push_executed(Box::new(CommandGroup {
                 label: label.into(),
                 commands: pushed,
@@ -185,6 +429,7 @@ impl CommandHistory {
         let produced = self.pushes.saturating_sub(span.0) as usize;
         let take = produced.min(self.undo_stack.len());
         let at = self.undo_stack.len() - take;
+        self.at = self.at.saturating_sub(take);
         self.undo_stack.split_off(at)
     }
 
@@ -209,6 +454,7 @@ impl CommandHistory {
         let mut bytes = self.heap_bytes();
         while bytes > self.budget_bytes && self.undo_stack.len() > 1 {
             bytes -= self.undo_stack.remove(0).heap_bytes();
+            self.trimmed += 1;
             report_budget_reached(self.budget_bytes);
         }
     }
@@ -221,8 +467,22 @@ impl CommandHistory {
             command.undo(world);
             self.redo_stack.push(command);
             self.revision = next_revision();
+            self.at = self.at.saturating_sub(1);
+        }
+        if dropped.is_some() {
+            self.saved = None;
         }
         dropped
+    }
+
+    /// Drops the entry the next redo would apply, and the state it leads
+    /// to, as if it had never been made.
+    pub fn discard_next_redo(&mut self) -> Option<Box<dyn EditorCommand>> {
+        let command = self.redo_stack.pop()?;
+        if self.at + 1 < self.states.len() {
+            self.states.remove(self.at + 1);
+        }
+        Some(command)
     }
 
     /// Redoes the next entry, dropping the ones whose target is gone as
@@ -233,14 +493,25 @@ impl CommandHistory {
             command.execute(world);
             self.undo_stack.push(command);
             self.revision = next_revision();
+            // A rolled-back batch can leave more to redo than states ahead.
+            if self.at + 1 == self.states.len() {
+                self.enter_new_state();
+            } else {
+                self.at += 1;
+            }
+        }
+        if dropped.is_some() {
+            self.saved = None;
         }
         dropped
     }
 
     pub fn push_executed(&mut self, command: Box<dyn EditorCommand>) {
+        self.keep_way_back();
         self.undo_stack.push(command);
         self.pushes += 1;
         self.revision = next_revision();
+        self.enter_new_state();
         self.redo_stack.clear();
         self.trim_to_budget();
     }
@@ -367,6 +638,95 @@ mod tests {
         assert_eq!(history.redo(&mut world), None);
     }
 
+    fn rolled_back_edit(history: &mut CommandHistory) {
+        let redo = std::mem::take(&mut history.redo_stack);
+        let span = history.begin_span();
+        history.push_executed(Box::new(Weighty(1)));
+        let _ = history.take_span(span);
+        history.redo_stack = redo;
+    }
+
+    #[test]
+    fn redoing_past_a_rolled_back_batch_gives_each_entry_its_own_state() {
+        let mut world = World::new();
+        let mut history = CommandHistory::default();
+        history.push_executed(Box::new(Weighty(1)));
+        history.push_executed(Box::new(Weighty(1)));
+        history.undo(&mut world);
+        history.undo(&mut world);
+        rolled_back_edit(&mut history);
+
+        history.redo(&mut world);
+        let first = history.state();
+        history.mark_current_saved();
+        history.redo(&mut world);
+        assert_ne!(history.state(), first);
+        assert!(
+            !history.is_saved(),
+            "the second entry is not what was saved"
+        );
+        history.undo(&mut world);
+        assert!(history.is_saved());
+    }
+
+    #[test]
+    fn a_rolled_back_batch_leaves_the_saved_state_saved() {
+        let mut history = CommandHistory::default();
+        rolled_back_edit(&mut history);
+        assert!(history.is_saved());
+    }
+
+    #[test]
+    fn a_rolled_back_batch_that_cut_off_the_saved_state_does_not_read_saved_on_redo() {
+        let mut world = World::new();
+        let mut history = CommandHistory::default();
+        history.push_executed(Box::new(Weighty(1)));
+        history.mark_current_saved();
+        history.undo(&mut world);
+        rolled_back_edit(&mut history);
+        history.redo(&mut world);
+        assert!(!history.is_saved());
+    }
+
+    #[test]
+    fn trimming_keeps_the_saved_state_where_it_was() {
+        let mut world = World::new();
+        let mut history = CommandHistory {
+            budget_bytes: 25,
+            ..default()
+        };
+        let opened = history.state();
+        history.push_executed(Box::new(Weighty(10)));
+        history.push_executed(Box::new(Weighty(10)));
+        history.mark_current_saved();
+        history.push_executed(Box::new(Weighty(10)));
+        history.push_executed(Box::new(Weighty(10)));
+        assert_eq!(history.undo_stack.len(), 2, "two entries were trimmed");
+
+        history.undo(&mut world);
+        history.undo(&mut world);
+        assert!(history.is_saved(), "the oldest state left is the saved one");
+        assert_ne!(history.state(), opened);
+        history.redo(&mut world);
+        assert!(!history.is_saved());
+    }
+
+    #[test]
+    fn a_saved_state_trimmed_away_cannot_read_saved() {
+        let mut world = World::new();
+        let mut history = CommandHistory {
+            budget_bytes: 15,
+            ..default()
+        };
+        history.push_executed(Box::new(Weighty(10)));
+        history.push_executed(Box::new(Weighty(10)));
+        history.undo(&mut world);
+        assert!(
+            !history.is_saved(),
+            "the opened state was trimmed from reach"
+        );
+    }
+
     #[test]
     fn a_history_inside_its_budget_keeps_every_entry() {
         let mut history = CommandHistory {
@@ -485,6 +845,200 @@ mod tests {
 
         assert_eq!(history.undo_stack.len(), 2);
         assert_eq!(history.undo_stack[0].description(), "weighty");
+    }
+
+    #[test]
+    fn a_saved_state_is_found_again_by_undo_and_redo_and_lost_to_a_new_edit() {
+        struct Noop;
+        impl EditorCommand for Noop {
+            fn execute(&mut self, _world: &mut World) {}
+            fn undo(&mut self, _world: &mut World) {}
+            fn description(&self) -> &str {
+                "noop"
+            }
+        }
+        let mut world = World::new();
+        let mut history = CommandHistory::default();
+        assert!(history.is_saved(), "a new document is as its file");
+
+        history.execute(Box::new(Noop), &mut world);
+        assert!(!history.is_saved());
+        history.undo(&mut world);
+        assert!(history.is_saved());
+
+        history.execute(Box::new(Noop), &mut world);
+        history.mark_current_saved();
+        history.undo(&mut world);
+        assert!(!history.is_saved());
+        history.redo(&mut world);
+        assert!(history.is_saved());
+
+        history.undo(&mut world);
+        history.execute(Box::new(Noop), &mut world);
+        assert!(!history.is_saved(), "the same depth, another state");
+        history.undo(&mut world);
+        assert!(!history.is_saved(), "the saved state is out of reach");
+    }
+
+    #[test]
+    fn a_span_of_one_entry_keeps_the_state_and_of_several_makes_one() {
+        struct Noop;
+        impl EditorCommand for Noop {
+            fn execute(&mut self, _world: &mut World) {}
+            fn undo(&mut self, _world: &mut World) {}
+            fn description(&self) -> &str {
+                "noop"
+            }
+        }
+        let mut world = World::new();
+        let mut history = CommandHistory::default();
+        let span = history.begin_span();
+        history.push_executed(Box::new(Noop));
+        let one = history.state();
+        history.end_span(span, "one");
+        assert_eq!(history.state(), one);
+        history.mark_current_saved();
+
+        let span = history.begin_span();
+        history.push_executed(Box::new(Noop));
+        history.push_executed(Box::new(Noop));
+        history.end_span(span, "two");
+        assert!(!history.is_saved());
+        history.undo(&mut world);
+        assert!(history.is_saved(), "one undo goes back over the group");
+    }
+
+    #[derive(Resource, Default)]
+    struct Doc(Vec<&'static str>);
+
+    struct Step(&'static str);
+
+    impl EditorCommand for Step {
+        fn execute(&mut self, world: &mut World) {
+            world.resource_mut::<Doc>().0.push(self.0);
+        }
+        fn undo(&mut self, world: &mut World) {
+            world.resource_mut::<Doc>().0.pop();
+        }
+        fn description(&self) -> &str {
+            self.0
+        }
+    }
+
+    fn doc_world() -> World {
+        let mut world = World::new();
+        world.init_resource::<Doc>();
+        world
+    }
+
+    fn doc(world: &World) -> Vec<&'static str> {
+        world.resource::<Doc>().0.clone()
+    }
+
+    #[test]
+    fn returning_to_a_mark_undoes_what_followed_and_leaves_nothing_to_redo() {
+        let mut world = doc_world();
+        let mut history = CommandHistory::default();
+        history.execute(Box::new(Step("a")), &mut world);
+        history.mark_current_saved();
+        history.hold_mark();
+        history.execute(Box::new(Step("b")), &mut world);
+        history.execute(Box::new(Step("c")), &mut world);
+        history.undo(&mut world);
+        assert!(history.left_mark());
+
+        let returned = history.return_to_mark(&mut world);
+
+        assert!(returned.reached);
+        assert_eq!(doc(&world), ["a"]);
+        assert!(history.redo_stack.is_empty());
+        assert!(history.is_saved());
+        assert!(!history.holds_mark());
+        history.redo(&mut world);
+        assert_eq!(doc(&world), ["a"]);
+    }
+
+    #[test]
+    fn returning_to_a_mark_redoes_an_undo_made_since_and_keeps_the_older_redo() {
+        let mut world = doc_world();
+        let mut history = CommandHistory::default();
+        history.execute(Box::new(Step("a")), &mut world);
+        history.execute(Box::new(Step("b")), &mut world);
+        history.undo(&mut world);
+        history.hold_mark();
+        history.undo(&mut world);
+
+        history.return_to_mark(&mut world);
+
+        assert_eq!(doc(&world), ["a"]);
+        assert_eq!(history.redo_stack.len(), 1, "the redo older than the mark");
+    }
+
+    #[test]
+    fn undoing_below_the_mark_then_editing_still_returns_to_the_mark() {
+        let mut world = doc_world();
+        let mut history = CommandHistory::default();
+        history.execute(Box::new(Step("a")), &mut world);
+        history.execute(Box::new(Step("b")), &mut world);
+        history.execute(Box::new(Step("c")), &mut world);
+        history.mark_current_saved();
+        history.hold_mark();
+        history.undo(&mut world);
+        history.undo(&mut world);
+        history.execute(Box::new(Step("d")), &mut world);
+        history.undo(&mut world);
+        history.undo(&mut world);
+        history.execute(Box::new(Step("e")), &mut world);
+        assert_eq!(doc(&world), ["e"]);
+
+        let returned = history.return_to_mark(&mut world);
+
+        assert!(returned.reached);
+        assert_eq!(doc(&world), ["a", "b", "c"]);
+        assert!(history.is_saved());
+        assert!(history.redo_stack.is_empty());
+        history.undo(&mut world);
+        assert_eq!(
+            doc(&world),
+            ["a", "b"],
+            "the restored entries undo as before"
+        );
+    }
+
+    #[test]
+    fn an_entry_gone_among_the_edits_since_the_mark_leaves_the_older_entries_alone() {
+        let mut world = doc_world();
+        let mut history = CommandHistory::default();
+        history.execute(Box::new(Step("a")), &mut world);
+        history.hold_mark();
+        history.execute(Box::new(Step("b")), &mut world);
+        history.push_executed(Box::new(Gone));
+        history.execute(Box::new(Step("c")), &mut world);
+
+        let returned = history.return_to_mark(&mut world);
+
+        assert!(returned.reached);
+        assert_eq!(returned.dropped.as_deref(), Some("its target closed"));
+        assert_eq!(doc(&world), ["a"]);
+        assert_eq!(history.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn a_mark_whose_entries_the_budget_dropped_is_out_of_reach() {
+        let mut world = doc_world();
+        let mut history = CommandHistory {
+            budget_bytes: 1,
+            ..Default::default()
+        };
+        history.push_executed(Box::new(Weighty(1)));
+        history.hold_mark();
+        history.push_executed(Box::new(Weighty(1)));
+        history.push_executed(Box::new(Weighty(1)));
+
+        let returned = history.return_to_mark(&mut world);
+
+        assert!(!returned.reached);
+        assert!(!history.is_saved());
     }
 
     #[test]

@@ -26,9 +26,10 @@
 
 | Key | Action |
 |-----|--------|
-| Esc | Translate mode |
-| R | Rotate mode |
-| T | Scale mode |
+| Q | Select tool |
+| W | Translate tool |
+| E | Rotate tool |
+| R | Scale tool |
 | X | Toggle local / world space |
 | M | Toggle snapping (same as the toolbar magnet) |
 | MMB | Toggle snap |
@@ -106,6 +107,11 @@
 
 | Key | Action |
 |-----|--------|
+| F5 | Play, or resume a paused game |
+| Ctrl+F5 (Cmd+F5 on macOS) | Restart |
+| F7 | Pause or resume |
+| F8 | Stop, also while input is captured |
+| F10 | Step one tick while paused |
 | Esc | Forward to the game (opens its in-game menu) while capturing |
 | Shift+Esc | Release input capture, return control to the editor |
 

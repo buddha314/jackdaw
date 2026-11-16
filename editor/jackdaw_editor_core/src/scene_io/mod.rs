@@ -15,6 +15,7 @@ mod legacy;
 mod load;
 mod registration;
 pub mod save;
+pub mod save_worker;
 pub mod stamp;
 
 pub use legacy::{load_inline_assets, load_scene_from_jsn};
@@ -33,6 +34,7 @@ pub use save::{
     save_layout_to_project, save_scene, save_scene_as, save_scene_with_outcome,
 };
 pub(crate) use save::{emit_bsn_entities_with_inline_assets, save_scene_inner};
+pub use save_worker::{save_in_background, saves_in_flight, wait_for_saves};
 
 use load::poll_scene_dialog;
 
@@ -330,6 +332,7 @@ pub struct SceneIoPlugin;
 
 impl Plugin for SceneIoPlugin {
     fn build(&self, app: &mut App) {
+        save_worker::plugin(app);
         app.init_resource::<SceneFilePath>()
             .init_resource::<jackdaw_bsn::UnresolvedReferences>()
             .init_resource::<asset_names::EmbeddedNames>()
@@ -339,12 +342,39 @@ impl Plugin for SceneIoPlugin {
                     .run_if(resource_exists_and_changed::<jackdaw_bsn::BsnSceneAssets>),
             )
             .init_resource::<hooks::DocumentIoHooks>()
-            .init_resource::<SceneDirtyState>()
             .add_systems(
                 Update,
                 poll_scene_dialog.run_if(in_state(crate::AppState::Editor)),
             )
-            .add_systems(PostUpdate, deactivate_document_cameras);
+            .add_systems(PostUpdate, deactivate_document_cameras)
+            .add_systems(
+                PostUpdate,
+                lift_document_default_ui_camera.before(bevy::ui::UiSystems::Prepare),
+            );
+    }
+}
+
+/// Takes `IsDefaultUiCamera` off document entities in the editor's world, so
+/// every editor UI root keeps resolving to the shell camera. The document keeps
+/// the marker, and a save writes it.
+fn lift_document_default_ui_camera(
+    marked: Query<
+        Entity,
+        (
+            With<bevy::ui::IsDefaultUiCamera>,
+            Or<(
+                With<jackdaw_bsn::AstNodeRef>,
+                With<crate::entity_ops::SceneCamera>,
+            )>,
+            Without<crate::EditorEntity>,
+        ),
+    >,
+    mut commands: Commands,
+) {
+    for entity in &marked {
+        commands
+            .entity(entity)
+            .remove::<bevy::ui::IsDefaultUiCamera>();
     }
 }
 
@@ -374,18 +404,17 @@ fn deactivate_document_cameras(
     }
 }
 
-/// Tracks whether the scene has unsaved changes by comparing the current
-/// undo stack length against the length at the time of last save/load/new.
-#[derive(Resource, Default)]
-pub struct SceneDirtyState {
-    pub undo_len_at_save: usize,
-}
-
-/// Returns `true` when the scene has unsaved changes.
+/// Returns `true` when the scene in front has unsaved changes.
 pub fn is_scene_dirty(world: &World) -> bool {
-    let history = world.resource::<jackdaw_commands::CommandHistory>();
-    let dirty_state = world.resource::<SceneDirtyState>();
-    history.undo_stack.len() != dirty_state.undo_len_at_save
+    let has_tab = world
+        .get_resource::<crate::scenes::Scenes>()
+        .is_some_and(|scenes| scenes.tabs.get(scenes.active).is_some());
+    if has_tab {
+        return crate::scenes::operators::active_tab_modified(world);
+    }
+    world
+        .get_resource::<jackdaw_commands::CommandHistory>()
+        .is_some_and(|history| !history.is_saved())
 }
 
 pub use jackdaw_api_internal::document::{SceneFilePath, SceneMetadata};
