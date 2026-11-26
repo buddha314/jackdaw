@@ -6,7 +6,7 @@
 
 use crate::util;
 
-use bevy::animation::{AnimationPlayer, AnimationTargetId, graph::AnimationGraphHandle};
+use bevy::animation::{AnimationPlayer, AnimationTargetId, graph::BlendGraphHandle};
 use bevy::prelude::*;
 use jackdaw::animation::AnimationLibrary;
 use jackdaw_animation_runtime::{
@@ -247,7 +247,7 @@ fn previewing_a_clip_on_a_bound_set_restores_the_set_state_on_stop() {
     );
     settle_until(&mut app, "the preview took the player", |app| {
         app.world()
-            .get::<AnimationGraphHandle>(player)
+            .get::<BlendGraphHandle>(player)
             .is_some_and(|handle| handle.0.id() != own_graph)
     });
 
@@ -258,7 +258,7 @@ fn previewing_a_clip_on_a_bound_set_restores_the_set_state_on_stop() {
 
     assert_eq!(
         app.world()
-            .get::<AnimationGraphHandle>(player)
+            .get::<BlendGraphHandle>(player)
             .map(|handle| handle.0.id()),
         Some(own_graph),
         "stopping must hand the set's own graph back"
@@ -306,7 +306,7 @@ fn previewing_on_a_bare_skeleton_leaves_no_player_behind() {
         app.world().get::<AnimationPlayer>(rig).is_none(),
         "the player the preview installed has to go with it"
     );
-    assert!(app.world().get::<AnimationGraphHandle>(rig).is_none());
+    assert!(app.world().get::<BlendGraphHandle>(rig).is_none());
     for entity in [rig, bone] {
         assert!(
             app.world().get::<AnimationTargetId>(entity).is_none(),

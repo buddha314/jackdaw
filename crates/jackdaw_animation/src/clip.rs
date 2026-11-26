@@ -2,7 +2,7 @@
 //! stored in the scene AST and round-tripped through JSN/BSN.
 //!
 //! These are the **authoring** representation. [`compile_clips`]
-//! converts them into real Bevy `AnimationClip` + `AnimationGraph`
+//! converts them into real Bevy `AnimationClip` + `BlendGraph`
 //! assets; from that point Bevy's own `AnimationPlayer` handles
 //! playback. Jackdaw never interprets keyframes or samples curves.
 //!
@@ -89,7 +89,7 @@ impl LoopMode {
 #[derive(Reflect, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 #[reflect(Default)]
 pub enum Interpolation {
-    /// Blend between adjacent keyframes via `Animatable::interpolate`.
+    /// Blend between adjacent keyframes via `Blendable::interpolate`.
     #[default]
     Linear,
     /// Ease between keyframes along a cubic spline whose tangents are read

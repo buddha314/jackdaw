@@ -23,7 +23,7 @@ use std::{
 use bevy::{
     animation::{
         ActiveAnimation, AnimatedBy, AnimationTargetId, RepeatAnimation,
-        graph::{AnimationGraph, AnimationGraphHandle, AnimationNodeIndex},
+        graph::{BlendGraph, BlendGraphHandle, BlendNodeIndex},
         transition::AnimationTransitions,
     },
     asset::AssetPlugin,
@@ -142,9 +142,9 @@ pub struct AnimationSetBound {
     /// The skeleton root, which carries the [`AnimationPlayer`].
     pub player: Entity,
     /// The graph node each playable state was added as.
-    pub nodes: HashMap<String, AnimationNodeIndex>,
+    pub nodes: HashMap<String, BlendNodeIndex>,
     /// The graph every animated root under this set shares.
-    pub graph: Handle<AnimationGraph>,
+    pub graph: Handle<BlendGraph>,
     /// Further animated roots: parts whose skeleton could not be folded into
     /// the primary one and so kept their own.
     pub parts: Vec<Entity>,
@@ -198,7 +198,7 @@ impl Plugin for AnimationRuntimePlugin {
                     .run_if(
                         resource_exists::<AssetServer>
                             .and_then(resource_exists::<Assets<Gltf>>)
-                            .and_then(resource_exists::<Assets<AnimationGraph>>),
+                            .and_then(resource_exists::<Assets<BlendGraph>>),
                     ),
             )
             .add_systems(
@@ -213,7 +213,7 @@ impl Plugin for AnimationRuntimePlugin {
                     .run_if(
                         resource_exists::<AssetServer>
                             .and_then(resource_exists::<Assets<Gltf>>)
-                            .and_then(resource_exists::<Assets<AnimationGraph>>)
+                            .and_then(resource_exists::<Assets<BlendGraph>>)
                             .and_then(resource_exists::<Assets<AnimationGraphAsset>>),
                     ),
             )
@@ -255,7 +255,7 @@ fn bind_animation_sets(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     gltfs: Res<Assets<Gltf>>,
-    mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut graphs: ResMut<Assets<BlendGraph>>,
     unbound: Query<
         (
             Entity,
@@ -295,7 +295,7 @@ fn bind_animation_sets(
             continue;
         };
 
-        let mut graph = AnimationGraph::new();
+        let mut graph = BlendGraph::new();
         let mut nodes = HashMap::new();
         for def in &set.states {
             let Some(gltf) = loaded.get(def.source) else {
@@ -339,7 +339,7 @@ fn bind_animation_sets(
         }
         commands
             .entity(root)
-            .insert((player, AnimationGraphHandle(graph.clone()), transitions));
+            .insert((player, BlendGraphHandle(graph.clone()), transitions));
 
         if state.is_none() {
             commands
@@ -506,7 +506,7 @@ pub fn write_clip_playheads(
     >,
     graphs: Query<(Entity, &AnimationGraphBound, &graph::AnimationGraphPlayback)>,
     players: Query<&AnimationPlayer>,
-    installed: Query<&AnimationGraphHandle>,
+    installed: Query<&BlendGraphHandle>,
     children: Query<&Children>,
     names: Query<&Name>,
     marked: Query<(), With<ClipEvent>>,
@@ -555,8 +555,8 @@ pub fn write_clip_playheads(
 /// one an editor swapped in to preview a clip through it.
 fn plays_its_own_graph(
     player: Entity,
-    graph: &Handle<AnimationGraph>,
-    installed: &Query<&AnimationGraphHandle>,
+    graph: &Handle<BlendGraph>,
+    installed: &Query<&BlendGraphHandle>,
 ) -> bool {
     installed
         .get(player)
@@ -656,9 +656,9 @@ fn report_finished_states(
 /// The state definition and graph node a name asks for, when the set has both.
 fn resolve_state<'a>(
     set: &'a AnimationSet,
-    nodes: &HashMap<String, AnimationNodeIndex>,
+    nodes: &HashMap<String, BlendNodeIndex>,
     wanted: &str,
-) -> Option<(&'a AnimationStateDef, AnimationNodeIndex)> {
+) -> Option<(&'a AnimationStateDef, BlendNodeIndex)> {
     let def = set.states.iter().find(|def| def.name == wanted)?;
     let node = *nodes.get(wanted)?;
     Some((def, node))
@@ -667,7 +667,7 @@ fn resolve_state<'a>(
 /// Starts a state on one animated root, fading out whatever it replaces.
 fn play_state(
     def: &AnimationStateDef,
-    node: AnimationNodeIndex,
+    node: BlendNodeIndex,
     player: &mut AnimationPlayer,
     transitions: &mut AnimationTransitions,
 ) {
@@ -707,11 +707,9 @@ fn bind_extra_root(
     if let Some((def, node)) = resolve_state(set, &bound.nodes, wanted) {
         play_state(def, node, &mut player, &mut transitions);
     }
-    commands.entity(root).insert((
-        player,
-        AnimationGraphHandle(bound.graph.clone()),
-        transitions,
-    ));
+    commands
+        .entity(root)
+        .insert((player, BlendGraphHandle(bound.graph.clone()), transitions));
 }
 
 /// The joints each of a part's meshes should point at once it wears the

@@ -170,7 +170,7 @@ async fn read_layer(
         AssetServerMode::Unprocessed => source.reader(),
     };
     let mut reader = reader
-        .read(path.path())
+        .read(bevy::asset::CowArc::Borrowed(path.path()))
         .await
         .map_err(|err| format!("{path}: {err}"))?;
     let mut bytes = Vec::new();

@@ -8,7 +8,7 @@
 use bevy::{
     animation::{
         AnimationClip, AnimationTargetId, animated_field,
-        animation_curves::{AnimatableCurve, AnimatableKeyframeCurve},
+        animation_curves::{BlendableCurve, BlendableKeyframeCurve},
         transition::AnimationTransitions,
     },
     gltf::Gltf,
@@ -88,13 +88,13 @@ fn a_loaded_scene_plays_its_default_state() {
 /// Puts a file holding one named clip where the asset server would find it,
 /// so the test needs no glTF on disk.
 fn stand_in_for_source(app: &mut App, path: &'static str, clip_name: &str) {
-    let curve = AnimatableKeyframeCurve::new([(0.0, Vec3::ZERO), (1.0, Vec3::X)])
+    let curve = BlendableKeyframeCurve::new([(0.0, Vec3::ZERO), (1.0, Vec3::X)])
         .expect("two keyframes make a curve");
     let mut clip = AnimationClip::default();
     let names = [Name::new("Armature")];
     clip.add_curve_to_target(
         AnimationTargetId::from_names(names.iter()),
-        AnimatableCurve::new(animated_field!(Transform::translation), curve),
+        BlendableCurve::new(animated_field!(Transform::translation), curve),
     );
     let clip = app
         .world_mut()

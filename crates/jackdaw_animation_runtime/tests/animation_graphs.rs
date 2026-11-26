@@ -7,8 +7,8 @@ use std::time::Duration;
 use bevy::{
     animation::{
         ActiveAnimation, AnimationClip, AnimationTargetId, animated_field,
-        animation_curves::{AnimatableCurve, AnimatableKeyframeCurve},
-        graph::{AnimationGraph, AnimationNodeType},
+        animation_curves::{BlendableCurve, BlendableKeyframeCurve},
+        graph::{BlendGraph, BlendNodeType},
     },
     asset::AssetPlugin,
     gltf::Gltf,
@@ -78,12 +78,12 @@ fn sliding_clip(app: &mut App, path: &[&str]) -> Handle<AnimationClip> {
         .iter()
         .map(|name| Name::new(name.to_string()))
         .collect();
-    let curve = AnimatableKeyframeCurve::new([(0.0, Vec3::ZERO), (1.0, Vec3::X)])
+    let curve = BlendableKeyframeCurve::new([(0.0, Vec3::ZERO), (1.0, Vec3::X)])
         .expect("two keyframes make a curve");
     let mut clip = AnimationClip::default();
     clip.add_curve_to_target(
         AnimationTargetId::from_names(names.iter()),
-        AnimatableCurve::new(animated_field!(Transform::translation), curve),
+        BlendableCurve::new(animated_field!(Transform::translation), curve),
     );
     app.world_mut()
         .resource_mut::<Assets<AnimationClip>>()
@@ -197,7 +197,7 @@ fn clip_weight(app: &App, root: Entity, clip: &Handle<AnimationClip>) -> f32 {
         .world()
         .get::<AnimationGraphBound>(root)
         .expect("the graph is bound");
-    let graphs = app.world().resource::<Assets<AnimationGraph>>();
+    let graphs = app.world().resource::<Assets<BlendGraph>>();
     let graph = graphs.get(&bound.graph).expect("the compiled graph");
     let player = app
         .world()
@@ -206,7 +206,7 @@ fn clip_weight(app: &App, root: Entity, clip: &Handle<AnimationClip>) -> f32 {
     graph
         .nodes()
         .find(|&node| match &graph[node].node_type {
-            AnimationNodeType::Clip(held) => held.id() == clip.id(),
+            BlendNodeType::Clip(held) => held.id() == clip.id(),
             _ => false,
         })
         .and_then(|node| player.animation(node))
@@ -219,7 +219,7 @@ fn state_weight(app: &App, root: Entity, state: &str) -> f32 {
         .world()
         .get::<AnimationGraphBound>(root)
         .expect("the graph is bound");
-    let graphs = app.world().resource::<Assets<AnimationGraph>>();
+    let graphs = app.world().resource::<Assets<BlendGraph>>();
     let graph = graphs.get(&bound.graph).expect("the compiled graph");
     graph[bound.node(state).expect("the state compiled")].weight
 }
@@ -230,10 +230,10 @@ fn clip_of(app: &App, root: Entity, state: &str) -> Handle<AnimationClip> {
         .world()
         .get::<AnimationGraphBound>(root)
         .expect("the graph is bound");
-    let graphs = app.world().resource::<Assets<AnimationGraph>>();
+    let graphs = app.world().resource::<Assets<BlendGraph>>();
     let graph = graphs.get(&bound.graph).expect("the compiled graph");
     match &graph[bound.node(state).expect("the state compiled")].node_type {
-        AnimationNodeType::Clip(handle) => handle.clone(),
+        BlendNodeType::Clip(handle) => handle.clone(),
         other => panic!("state `{state}` is a {other:?}, not a clip"),
     }
 }

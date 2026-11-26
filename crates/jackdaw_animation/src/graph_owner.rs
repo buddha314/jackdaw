@@ -9,7 +9,7 @@
 
 use bevy::animation::{
     AnimatedBy, AnimationPlayer, AnimationTargetId, RepeatAnimation,
-    graph::{AnimationGraph, AnimationGraphHandle, AnimationNodeIndex},
+    graph::{BlendGraph, BlendGraphHandle, BlendNodeIndex},
 };
 use bevy::prelude::*;
 
@@ -20,7 +20,7 @@ use bevy::prelude::*;
 #[derive(Component, Debug)]
 pub struct LoanedPlayer {
     /// The graph the target was playing, when it had one of its own.
-    graph: Option<Handle<AnimationGraph>>,
+    graph: Option<Handle<BlendGraph>>,
     /// Whether the editor put the player there, so returning it takes it away.
     player_is_ours: bool,
     /// Entities the editor gave a target id to, to be untagged on return.
@@ -30,9 +30,9 @@ pub struct LoanedPlayer {
 /// What the editor asks a borrowed player to do.
 pub struct PlayerLoan {
     /// The graph to play from while the loan lasts.
-    pub graph: Handle<AnimationGraph>,
+    pub graph: Handle<BlendGraph>,
     /// Which node of that graph to run.
-    pub node: AnimationNodeIndex,
+    pub node: BlendNodeIndex,
     /// Where to start it.
     pub seek: f32,
     /// Whether it runs or holds the frame it is seeked to.
@@ -49,7 +49,7 @@ pub struct PlayerLoan {
 
 impl PlayerLoan {
     /// A loan of `graph`'s `node`, held at time zero and paused.
-    pub fn new(graph: Handle<AnimationGraph>, node: AnimationNodeIndex) -> Self {
+    pub fn new(graph: Handle<BlendGraph>, node: BlendNodeIndex) -> Self {
         Self {
             graph,
             node,
@@ -107,7 +107,7 @@ pub fn lend_player(world: &mut World, target: Entity, loan: PlayerLoan) {
     };
     if !entity.contains::<LoanedPlayer>() {
         let graph = entity
-            .get::<AnimationGraphHandle>()
+            .get::<BlendGraphHandle>()
             .map(|handle| handle.0.clone());
         let player_is_ours = !entity.contains::<AnimationPlayer>();
         let mut tagged = loan.tagged;
@@ -120,7 +120,7 @@ pub fn lend_player(world: &mut World, target: Entity, loan: PlayerLoan) {
             tagged,
         });
     }
-    entity.insert(AnimationGraphHandle(loan.graph));
+    entity.insert(BlendGraphHandle(loan.graph));
     if !entity.contains::<AnimationPlayer>() {
         entity.insert(AnimationPlayer::default());
     }
@@ -165,7 +165,7 @@ pub fn return_player(world: &mut World, target: Entity) -> bool {
     };
     if loan.player_is_ours {
         entity.remove::<AnimationPlayer>();
-        entity.remove::<AnimationGraphHandle>();
+        entity.remove::<BlendGraphHandle>();
         entity.remove::<AnimationTargetId>();
         entity.remove::<AnimatedBy>();
         return false;
@@ -175,11 +175,11 @@ pub fn return_player(world: &mut World, target: Entity) -> bool {
     }
     match loan.graph {
         Some(graph) => {
-            entity.insert(AnimationGraphHandle(graph));
+            entity.insert(BlendGraphHandle(graph));
             true
         }
         None => {
-            entity.remove::<AnimationGraphHandle>();
+            entity.remove::<BlendGraphHandle>();
             false
         }
     }
@@ -189,16 +189,16 @@ pub fn return_player(world: &mut World, target: Entity) -> bool {
 mod tests {
     use super::*;
 
-    fn graph_with_one_clip(world: &mut World) -> (Handle<AnimationGraph>, AnimationNodeIndex) {
-        let mut graph = AnimationGraph::new();
+    fn graph_with_one_clip(world: &mut World) -> (Handle<BlendGraph>, BlendNodeIndex) {
+        let mut graph = BlendGraph::new();
         let node = graph.add_clip(Handle::default(), 1.0, graph.root);
-        let mut graphs = world.resource_mut::<Assets<AnimationGraph>>();
+        let mut graphs = world.resource_mut::<Assets<BlendGraph>>();
         (graphs.add(graph), node)
     }
 
     fn world_with_graphs() -> World {
         let mut world = World::new();
-        world.insert_resource(Assets::<AnimationGraph>::default());
+        world.insert_resource(Assets::<BlendGraph>::default());
         world
     }
 
@@ -213,7 +213,7 @@ mod tests {
 
         assert!(!return_player(&mut world, target));
         assert!(world.get::<AnimationPlayer>(target).is_none());
-        assert!(world.get::<AnimationGraphHandle>(target).is_none());
+        assert!(world.get::<BlendGraphHandle>(target).is_none());
     }
 
     #[test]
@@ -224,7 +224,7 @@ mod tests {
             .spawn((
                 Name::new("Armature"),
                 AnimationPlayer::default(),
-                AnimationGraphHandle(theirs.clone()),
+                BlendGraphHandle(theirs.clone()),
             ))
             .id();
         world
@@ -235,13 +235,13 @@ mod tests {
         let (ours, our_node) = graph_with_one_clip(&mut world);
         lend_player(&mut world, target, PlayerLoan::new(ours.clone(), our_node));
         assert_eq!(
-            world.get::<AnimationGraphHandle>(target).map(|h| h.0.id()),
+            world.get::<BlendGraphHandle>(target).map(|h| h.0.id()),
             Some(ours.id())
         );
 
         assert!(return_player(&mut world, target));
         assert_eq!(
-            world.get::<AnimationGraphHandle>(target).map(|h| h.0.id()),
+            world.get::<BlendGraphHandle>(target).map(|h| h.0.id()),
             Some(theirs.id()),
             "the graph the target was playing must come back"
         );

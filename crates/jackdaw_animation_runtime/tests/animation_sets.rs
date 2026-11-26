@@ -7,8 +7,8 @@ use std::time::Duration;
 use bevy::{
     animation::{
         AnimatedBy, AnimationClip, AnimationTargetId, animated_field,
-        animation_curves::{AnimatableCurve, AnimatableKeyframeCurve},
-        graph::AnimationNodeIndex,
+        animation_curves::{BlendableCurve, BlendableKeyframeCurve},
+        graph::BlendNodeIndex,
         transition::AnimationTransitions,
     },
     asset::AssetPlugin,
@@ -161,12 +161,12 @@ fn sliding_clip_lasting(app: &mut App, path: &[&str], seconds: f32) -> Handle<An
         .iter()
         .map(|name| Name::new(name.to_string()))
         .collect();
-    let curve = AnimatableKeyframeCurve::new([(0.0, Vec3::ZERO), (seconds, Vec3::X)])
+    let curve = BlendableKeyframeCurve::new([(0.0, Vec3::ZERO), (seconds, Vec3::X)])
         .expect("two keyframes make a curve");
     let mut clip = AnimationClip::default();
     clip.add_curve_to_target(
         AnimationTargetId::from_names(names.iter()),
-        AnimatableCurve::new(animated_field!(Transform::translation), curve),
+        BlendableCurve::new(animated_field!(Transform::translation), curve),
     );
     app.world_mut()
         .resource_mut::<Assets<AnimationClip>>()
@@ -211,7 +211,7 @@ fn target_of(app: &App, entity: Entity) -> AnimationTargetId {
         .expect("a bound bone carries a target id")
 }
 
-fn node_for(app: &App, root: Entity, state: &str) -> AnimationNodeIndex {
+fn node_for(app: &App, root: Entity, state: &str) -> BlendNodeIndex {
     app.world()
         .get::<AnimationSetBound>(root)
         .expect("the set is bound")

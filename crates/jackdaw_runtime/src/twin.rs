@@ -13,7 +13,7 @@ use bevy::asset::io::{
     AssetReader, AssetReaderError, AssetSourceBuilder, AssetSourceId, ErasedAssetReader,
     PathStream, Reader, VecReader,
 };
-use bevy::asset::{AssetApp, AssetMode, AssetPlugin};
+use bevy::asset::{AssetApp, AssetMode, AssetPlugin, CowArc};
 use bevy::prelude::*;
 
 /// Present once an asset source has been registered with twin resolution.
@@ -107,7 +107,7 @@ impl DocumentTwinReader {
 
     async fn read_twin<'a>(
         &'a self,
-        path: &'a Path,
+        path: &Path,
         meta: bool,
         missing: AssetReaderError,
     ) -> Result<Box<dyn Reader + 'a>, AssetReaderError> {
@@ -117,9 +117,9 @@ impl DocumentTwinReader {
         let mut bytes = Vec::new();
         {
             let read = if meta {
-                self.inner.read_meta(&twin).await
+                self.inner.read_meta(CowArc::Borrowed(twin.as_path())).await
             } else {
-                self.inner.read(&twin).await
+                self.inner.read(CowArc::Borrowed(twin.as_path())).await
             };
             let Ok(mut reader) = read else {
                 return Err(missing);
@@ -131,21 +131,27 @@ impl DocumentTwinReader {
 }
 
 impl AssetReader for DocumentTwinReader {
-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
-        match self.inner.read(path).await {
+    async fn read<'a>(
+        &'a self,
+        path: CowArc<'a, Path>,
+    ) -> Result<impl Reader + 'a, AssetReaderError> {
+        match self.inner.read(path.clone()).await {
             Ok(reader) => Ok(reader),
             Err(missing @ AssetReaderError::NotFound(_)) => {
-                self.read_twin(path, false, missing).await
+                self.read_twin(&path, false, missing).await
             }
             Err(err) => Err(err),
         }
     }
 
-    async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
-        match self.inner.read_meta(path).await {
+    async fn read_meta<'a>(
+        &'a self,
+        path: CowArc<'a, Path>,
+    ) -> Result<impl Reader + 'a, AssetReaderError> {
+        match self.inner.read_meta(path.clone()).await {
             Ok(reader) => Ok(reader),
             Err(missing @ AssetReaderError::NotFound(_)) => {
-                self.read_twin(path, true, missing).await
+                self.read_twin(&path, true, missing).await
             }
             Err(err) => Err(err),
         }

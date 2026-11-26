@@ -1,6 +1,6 @@
 //! Animation authoring and playback for the Jackdaw editor.
 //!
-//! Thin UI layer over Bevy's `AnimationClip`, `AnimationGraph`, and
+//! Thin UI layer over Bevy's `AnimationClip`, `BlendGraph`, and
 //! `AnimationPlayer`. Authored data (`Clip`, `AnimationTrack`,
 //! keyframes) lives in the scene AST and compiles into real Bevy
 //! assets at runtime. No custom curve evaluator; everything flows

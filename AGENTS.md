@@ -18,6 +18,28 @@
   `~/.cargo/bin/jackdaw` → `target/debug/jackdaw` and `~/.cargo/bin/jd` →
   `target/debug/jd` in this checkout. Do not `cargo install` over them.
 
+## Moving Bevy: avian first
+
+Follow `docs/upgrading-bevy.md` for any Bevy re-pin, including one that arrives
+through an upstream merge. In short:
+
+- **Avian sets the limit.** The newest usable Bevy commit is the newest one the
+  avian forks build against: jbuehler23's for the Physics module, buddha314's for
+  the games. Find it with `scripts/bevy_ceiling.py ceiling --forks
+  ../<game>/bevy_main_forks.json` before changing any lockfile. Never pin past it:
+  games without physics are not usable games.
+- **One Bevy revision everywhere.** The root, `integrations/physics` and
+  `integrations/navmesh` lockfiles move together, and games copy the revision from
+  here (`tools/jackdaw.sh sync`). Never pin a game to a Bevy this fork has not.
+- **Porting Jackdaw to a new Bevy is allowed** alongside bug fixes. Rename only
+  Bevy's identifiers, and do it on a `repin/bevy-<rev>` branch in a sibling
+  worktree.
+- **Forks are allowed when needed** (avian's dependencies such as parry and glamx,
+  or Bevy itself), but only under buddha314, wired in with `[patch]`, and kept in
+  the game's `bevy_main_forks.json`. Its generator force-pushes those branches.
+- Before calling a test failure a regression, check that it passes at the old pin.
+  The doc's log keeps the known-failing list and the current ceiling.
+
 ## Hard rule: jbuehler23 is read-only
 
 Never push to jbuehler23, whether through a named remote, a direct URL, GitHub CLI,
