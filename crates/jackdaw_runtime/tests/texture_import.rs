@@ -137,10 +137,19 @@ fn a_game_with_the_jackdaw_asset_source_loads_imported_textures() {
 async fn read_all(reader: &TextureImportReader, path: &Path, meta: bool) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut read = if meta {
-        Box::new(reader.read_meta(path).await.expect("the meta reads"))
-            as Box<dyn bevy::asset::io::Reader>
+        Box::new(
+            reader
+                .read_meta(bevy::asset::CowArc::Borrowed(path))
+                .await
+                .expect("the meta reads"),
+        ) as Box<dyn bevy::asset::io::Reader>
     } else {
-        Box::new(reader.read(path).await.expect("the file reads"))
+        Box::new(
+            reader
+                .read(bevy::asset::CowArc::Borrowed(path))
+                .await
+                .expect("the file reads"),
+        )
     };
     read.read_to_end(&mut bytes).await.expect("the bytes read");
     bytes
@@ -161,7 +170,7 @@ fn a_texture_with_no_import_meta_reads_byte_identically() {
     let plain = block_on(read_all(&reader, Path::new("plain.png"), false));
     assert_eq!(plain, std::fs::read(dir.path().join("plain.png")).unwrap());
     assert!(matches!(
-        block_on(reader.read_meta(Path::new("plain.png"))),
+        block_on(reader.read_meta(bevy::asset::CowArc::Borrowed(Path::new("plain.png")))),
         Err(AssetReaderError::NotFound(_))
     ));
     assert_eq!(

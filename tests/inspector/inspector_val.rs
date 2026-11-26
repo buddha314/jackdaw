@@ -1043,7 +1043,7 @@ fn an_align_combobox_commit_updates_align_items() {
     app.update();
     assert_eq!(
         app.world().get::<Node>(entity).map(|n| n.align_items),
-        Some(AlignItems::Default),
+        Some(AlignItems::Normal),
         "undo restores the pre-pick value",
     );
     assert_eq!(
@@ -1067,7 +1067,7 @@ fn the_justify_group_writes_its_own_fields() {
     assert_eq!(node.justify_content, JustifyContent::Center);
     assert_eq!(
         node.align_content,
-        AlignContent::Default,
+        AlignContent::Normal,
         "the align group is untouched",
     );
 }

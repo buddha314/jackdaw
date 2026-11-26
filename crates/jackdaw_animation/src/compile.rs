@@ -1,6 +1,6 @@
 //! AST to Bevy animation compile step.
 //!
-//! Rebuilds `AnimationClip` + `AnimationGraph` from the authored
+//! Rebuilds `AnimationClip` + `BlendGraph` from the authored
 //! track/keyframe tree whenever it changes. Output is stored as a
 //! runtime-only `CompiledClip` component, never serialized.
 //!
@@ -13,9 +13,9 @@ use std::collections::HashSet;
 
 use bevy::animation::{
     AnimationClip, AnimationTargetId, animated_field,
-    animation_curves::{AnimatableCurve, AnimatableKeyframeCurve, AnimatableProperty},
+    animation_curves::{BlendableCurve, BlendableKeyframeCurve, BlendableProperty},
     gltf_curves::{CubicKeyframeCurve, CubicRotationCurve, SteppedKeyframeCurve},
-    graph::{AnimationGraph, AnimationNodeIndex},
+    graph::{BlendGraph, BlendNodeIndex},
 };
 use bevy::prelude::*;
 
@@ -36,17 +36,17 @@ const SCALE: &str = "scale";
 /// Created the first time a clip is compiled; on subsequent compiles
 /// the underlying `AnimationClip` asset is **mutated in place** via
 /// `Assets::get_mut` so the handles (and the bound target's
-/// `AnimationGraphHandle`) stay valid across edits. Without this, every
+/// `BlendGraphHandle`) stay valid across edits. Without this, every
 /// recompile would produce fresh handles and the target would keep
 /// sampling the stale graph it was first bound to.
 #[derive(Component, Debug, Clone)]
 pub struct CompiledClip {
     pub clip: Handle<AnimationClip>,
-    pub graph: Handle<AnimationGraph>,
-    pub root_node: AnimationNodeIndex,
+    pub graph: Handle<BlendGraph>,
+    pub root_node: BlendNodeIndex,
 }
 
-/// Rebuild `AnimationClip` + `AnimationGraph` assets for any clip whose
+/// Rebuild `AnimationClip` + `BlendGraph` assets for any clip whose
 /// authored data changed this frame. Walks up from every changed entity
 /// (clip, track, or keyframe) to find the owning clip, deduplicates,
 /// then rebuilds each affected clip.
@@ -54,7 +54,7 @@ pub struct CompiledClip {
 /// On the **first** compile of a clip, we create fresh asset handles
 /// and attach a [`CompiledClip`] component. On **subsequent** compiles,
 /// we mutate the existing `AnimationClip` asset in place so the handle
-/// stays valid - otherwise the bound target's `AnimationGraphHandle`
+/// stays valid - otherwise the bound target's `BlendGraphHandle`
 /// would go stale after every edit.
 pub fn compile_clips(
     changed: Query<
@@ -78,7 +78,7 @@ pub fn compile_clips(
     f32_keyframes: Query<&F32Keyframe>,
     names: Query<&Name>,
     mut clip_store: ResMut<Assets<AnimationClip>>,
-    mut graph_store: ResMut<Assets<AnimationGraph>>,
+    mut graph_store: ResMut<Assets<BlendGraph>>,
     mut commands: Commands,
 ) {
     let mut dirty: HashSet<Entity> = HashSet::new();
@@ -140,7 +140,7 @@ pub fn compile_clips(
         new_clip_data.set_duration(target_duration);
 
         // If this clip was compiled before, mutate the existing asset
-        // in place so the target entity's `AnimationGraphHandle` stays
+        // in place so the target entity's `BlendGraphHandle` stays
         // valid. Otherwise spin up fresh assets.
         if let Ok(existing) = existing_compiled.get(clip_entity)
             && let Some(mut clip_data) = clip_store.get_mut(&existing.clip)
@@ -149,7 +149,7 @@ pub fn compile_clips(
             continue;
         }
         let clip_handle = clip_store.add(new_clip_data);
-        let (graph, root_node) = AnimationGraph::from_clip(clip_handle.clone());
+        let (graph, root_node) = BlendGraph::from_clip(clip_handle.clone());
         let graph_handle = graph_store.add(graph);
         commands.entity(clip_entity).insert(CompiledClip {
             clip: clip_handle,
@@ -161,7 +161,7 @@ pub fn compile_clips(
 
 /// Compile [`AnimationBlendGraph`] clips into [`CompiledClip`] by walking
 /// the node canvas subtree and resolving it to a Bevy
-/// [`AnimationGraph`]. Runs every frame, but cheap - only walks when
+/// [`BlendGraph`]. Runs every frame, but cheap - only walks when
 /// a blend graph clip doesn't yet have a `CompiledClip` or when its
 /// canvas contents changed.
 ///
@@ -174,7 +174,7 @@ pub fn compile_clips(
 /// un-compiled until a later phase adds the proper tree walker.
 ///
 /// [`AnimationBlendGraph`]: crate::blend_graph::AnimationBlendGraph
-/// [`AnimationGraph`]: bevy::animation::graph::AnimationGraph
+/// [`BlendGraph`]: bevy::animation::graph::BlendGraph
 pub fn compile_blend_graphs(
     blend_graphs: Query<(Entity, Option<&Children>), (With<Clip>, With<AnimationBlendGraph>)>,
     existing_compiled: Query<&CompiledClip>,
@@ -318,7 +318,7 @@ fn add_vec3_curve<P>(
     interpolation: Interpolation,
     kfs: Vec<(f32, Vec3)>,
 ) where
-    P: AnimatableProperty<Property = Vec3> + Clone + Send + Sync + 'static,
+    P: BlendableProperty<Property = Vec3> + Clone + Send + Sync + 'static,
 {
     let kfs = padded(kfs);
     if kfs.is_empty() {
@@ -326,20 +326,20 @@ fn add_vec3_curve<P>(
     }
     match interpolation {
         Interpolation::Linear => {
-            if let Ok(curve) = AnimatableKeyframeCurve::new(kfs) {
-                clip.add_curve_to_target(target_id, AnimatableCurve::new(property, curve));
+            if let Ok(curve) = BlendableKeyframeCurve::new(kfs) {
+                clip.add_curve_to_target(target_id, BlendableCurve::new(property, curve));
             }
         }
         Interpolation::Step => {
             if let Ok(curve) = SteppedKeyframeCurve::new(kfs) {
-                clip.add_curve_to_target(target_id, AnimatableCurve::new(property, curve));
+                clip.add_curve_to_target(target_id, BlendableCurve::new(property, curve));
             }
         }
         Interpolation::Cubic => {
             let times: Vec<f32> = kfs.iter().map(|(t, _)| *t).collect();
             let values = spline_samples(&kfs, |a, b| a - b, |v, k| v * k, Vec3::ZERO);
             if let Ok(curve) = CubicKeyframeCurve::new(times, values) {
-                clip.add_curve_to_target(target_id, AnimatableCurve::new(property, curve));
+                clip.add_curve_to_target(target_id, BlendableCurve::new(property, curve));
             }
         }
     }
@@ -360,13 +360,13 @@ fn add_quat_curve(
     let property = animated_field!(Transform::rotation);
     match interpolation {
         Interpolation::Linear => {
-            if let Ok(curve) = AnimatableKeyframeCurve::new(kfs) {
-                clip.add_curve_to_target(target_id, AnimatableCurve::new(property, curve));
+            if let Ok(curve) = BlendableKeyframeCurve::new(kfs) {
+                clip.add_curve_to_target(target_id, BlendableCurve::new(property, curve));
             }
         }
         Interpolation::Step => {
             if let Ok(curve) = SteppedKeyframeCurve::new(kfs) {
-                clip.add_curve_to_target(target_id, AnimatableCurve::new(property, curve));
+                clip.add_curve_to_target(target_id, BlendableCurve::new(property, curve));
             }
         }
         Interpolation::Cubic => {
@@ -377,7 +377,7 @@ fn add_quat_curve(
             let as_vec4: Vec<(f32, Vec4)> = kfs.iter().map(|(t, q)| (*t, Vec4::from(*q))).collect();
             let values = spline_samples(&as_vec4, |a, b| a - b, |v, k| v * k, Vec4::ZERO);
             if let Ok(curve) = CubicRotationCurve::new(times, values) {
-                clip.add_curve_to_target(target_id, AnimatableCurve::new(property, curve));
+                clip.add_curve_to_target(target_id, BlendableCurve::new(property, curve));
             }
         }
     }
@@ -552,7 +552,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
             .init_asset::<AnimationClip>()
-            .init_asset::<AnimationGraph>()
+            .init_asset::<BlendGraph>()
             .add_systems(Update, compile_clips);
         app
     }

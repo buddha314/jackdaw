@@ -48,7 +48,7 @@ const SKIP_COMPONENT_PREFIXES: &[&str] = &[
     "bevy_ecs::observer::",
     "bevy_camera::primitives::",
     "bevy_camera::visibility::",
-    // AnimationPlayer / AnimationGraphHandle / AnimationTargetId / AnimatedBy
+    // AnimationPlayer / BlendGraphHandle / AnimationTargetId / AnimatedBy
     // are installed on targets at runtime by the animation plugin.
     // They're derived from the authored clip components and must not be
     // serialized; otherwise load would restore stale player state and

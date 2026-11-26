@@ -12,7 +12,6 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use bevy::asset::AssetPath;
 use bevy::asset::io::{
     AssetReader, AssetReaderError, AssetSourceBuilder, ErasedAssetReader, PathStream, Reader,
     VecReader,
@@ -21,6 +20,7 @@ use bevy::asset::meta::{AssetAction, AssetMeta, AssetMetaDyn};
 use bevy::asset::processor::{LoadTransformAndSave, LoadTransformAndSaveSettings};
 use bevy::asset::saver::{AssetSaver, SavedAsset};
 use bevy::asset::transformer::IdentityAssetTransformer;
+use bevy::asset::{AssetPath, CowArc};
 use bevy::image::{
     CompressedImageFormats, CompressedImageSaver, CompressedImageSaverSettings, ImageFormat,
     ImageFormatSetting, ImageLoader, ImageLoaderSettings, ImageType,
@@ -102,9 +102,9 @@ impl TextureImportReader {
     async fn read_all(&self, path: &Path, meta: bool) -> Result<Vec<u8>, AssetReaderError> {
         let mut bytes = Vec::new();
         let mut reader = if meta {
-            self.inner.read_meta(path).await?
+            self.inner.read_meta(CowArc::Borrowed(path)).await?
         } else {
-            self.inner.read(path).await?
+            self.inner.read(CowArc::Borrowed(path)).await?
         };
         reader.read_to_end(&mut bytes).await?;
         Ok(bytes)
@@ -188,7 +188,11 @@ fn load_meta(settings: ImageLoaderSettings) -> Vec<u8> {
 }
 
 impl AssetReader for TextureImportReader {
-    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+    async fn read<'a>(
+        &'a self,
+        path: CowArc<'a, Path>,
+    ) -> Result<impl Reader + 'a, AssetReaderError> {
+        let path: &Path = &path;
         let processed = self
             .processed
             .lock()
@@ -201,7 +205,11 @@ impl AssetReader for TextureImportReader {
         Ok(VecReader::new(bytes))
     }
 
-    async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+    async fn read_meta<'a>(
+        &'a self,
+        path: CowArc<'a, Path>,
+    ) -> Result<impl Reader + 'a, AssetReaderError> {
+        let path: &Path = &path;
         let meta = self.read_all(path, true).await?;
         let Some(loader) = read_texture_import_meta(&meta) else {
             return Ok(VecReader::new(meta));

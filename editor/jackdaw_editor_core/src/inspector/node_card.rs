@@ -169,7 +169,7 @@ const ALIGN_ITEMS: NodeEnumField = NodeEnumField {
         "CenterSafe",
     ],
     current: |node| match node.align_items {
-        AlignItems::Default => 0,
+        AlignItems::Normal => 0,
         AlignItems::Start => 1,
         AlignItems::End => 2,
         AlignItems::FlexStart => 3,
@@ -241,7 +241,7 @@ const ALIGN_CONTENT: NodeEnumField = NodeEnumField {
         "CenterSafe",
     ],
     current: |node| match node.align_content {
-        AlignContent::Default => 0,
+        AlignContent::Normal => 0,
         AlignContent::Start => 1,
         AlignContent::End => 2,
         AlignContent::FlexStart => 3,
@@ -274,7 +274,7 @@ const JUSTIFY_ITEMS: NodeEnumField = NodeEnumField {
         "CenterSafe",
     ],
     current: |node| match node.justify_items {
-        JustifyItems::Default => 0,
+        JustifyItems::Normal => 0,
         JustifyItems::Start => 1,
         JustifyItems::End => 2,
         JustifyItems::Center => 3,
@@ -334,7 +334,7 @@ const JUSTIFY_CONTENT: NodeEnumField = NodeEnumField {
         "CenterSafe",
     ],
     current: |node| match node.justify_content {
-        JustifyContent::Default => 0,
+        JustifyContent::Normal => 0,
         JustifyContent::Start => 1,
         JustifyContent::End => 2,
         JustifyContent::FlexStart => 3,

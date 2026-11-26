@@ -471,7 +471,10 @@ fn embedded_text(world: &World, path: &Path) -> Result<String, String> {
         .map_err(|err| err.to_string())?;
     let reader = source.reader();
     let bytes = bevy::tasks::block_on(async {
-        let mut file = reader.read(path).await.map_err(|err| err.to_string())?;
+        let mut file = reader
+            .read(bevy::asset::CowArc::Borrowed(path))
+            .await
+            .map_err(|err| err.to_string())?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .await

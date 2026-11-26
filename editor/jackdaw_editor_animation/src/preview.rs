@@ -7,7 +7,7 @@
 
 use bevy::animation::{
     AnimationPlayer,
-    graph::{AnimationGraph, AnimationGraphHandle, AnimationNodeIndex},
+    graph::{BlendGraph, BlendGraphHandle, BlendNodeIndex},
 };
 use bevy::gltf::Gltf;
 use bevy::prelude::*;
@@ -59,7 +59,7 @@ struct Active {
     /// The file the clip came from, held so its clips stay loaded while it plays.
     gltf: Handle<Gltf>,
     clip: String,
-    node: AnimationNodeIndex,
+    node: BlendNodeIndex,
     duration_secs: f32,
     elapsed_secs: f32,
     playing: bool,
@@ -299,8 +299,8 @@ fn start_requested_preview(world: &mut World) {
         .map_or(0.0, AnimationClip::duration);
     let repeat = jackdaw_editor_core::animation_mode::library::looped_hint(&request.clip);
     let tagged = jackdaw_animation_runtime::tag_animation_targets(world, player);
-    let (graph, node) = AnimationGraph::from_clip(clip_handle);
-    let graph = world.resource_mut::<Assets<AnimationGraph>>().add(graph);
+    let (graph, node) = BlendGraph::from_clip(clip_handle);
+    let graph = world.resource_mut::<Assets<BlendGraph>>().add(graph);
     lend_player(
         world,
         player,
@@ -512,7 +512,7 @@ fn restart_returned_sets(
     mut sets: Query<(&AnimationSetBound, &mut AnimationState)>,
     players: Query<&AnimationPlayer>,
     lent: Query<(), With<LoanedPlayer>>,
-    graphs: Query<&AnimationGraphHandle>,
+    graphs: Query<&BlendGraphHandle>,
 ) {
     for (bound, mut state) in &mut sets {
         if lent.contains(bound.player) {

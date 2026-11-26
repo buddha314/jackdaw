@@ -1,5 +1,5 @@
 //! Transport and target adoption. Installs/strips Bevy's runtime
-//! animation components (`AnimationPlayer`, `AnimationGraphHandle`,
+//! animation components (`AnimationPlayer`, `BlendGraphHandle`,
 //! `AnimationTargetId`, `AnimatedBy`) based on engagement state.
 //! None of these are persisted.
 

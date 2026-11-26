@@ -16,7 +16,7 @@ use std::{
 use bevy::{
     animation::{
         ActiveAnimation, AnimationClip, RepeatAnimation,
-        graph::{AnimationGraph, AnimationGraphHandle, AnimationNodeIndex},
+        graph::{BlendGraph, BlendGraphHandle, BlendNodeIndex},
         transition::AnimationTransitions,
     },
     asset::{AssetLoader, LoadContext, io::Reader},
@@ -352,7 +352,7 @@ pub struct AnimationGraphTransition {
 #[derive(Debug)]
 struct BoundClip {
     /// The clip's leaf in the Bevy graph.
-    node: AnimationNodeIndex,
+    node: BlendNodeIndex,
     /// Parameter value at which this clip carries the whole state.
     threshold: f32,
     /// Seconds the clip runs for, which an exit time is read against.
@@ -367,7 +367,7 @@ struct BoundClip {
 #[derive(Debug)]
 struct BoundState {
     /// The node a transition plays: the clip's leaf, or the blend above them.
-    node: AnimationNodeIndex,
+    node: BlendNodeIndex,
     /// Whether `node` is a blend, whose weight lives in the graph asset rather
     /// than on the player.
     blend: bool,
@@ -391,7 +391,7 @@ pub struct AnimationGraphBound {
     /// The skeleton root, which carries the [`AnimationPlayer`].
     pub player: Entity,
     /// The Bevy graph the states were compiled into.
-    pub graph: Handle<AnimationGraph>,
+    pub graph: Handle<BlendGraph>,
     /// One entry per state that compiled, in the order the file declared them.
     states: Vec<BoundState>,
     /// Where each state's name lands in `states`.
@@ -407,14 +407,14 @@ impl AnimationGraphBound {
         &self,
         player: &AnimationPlayer,
         state: &str,
-    ) -> Option<(&str, &str, AnimationNodeIndex)> {
+    ) -> Option<(&str, &str, BlendNodeIndex)> {
         let bound = self.states.get(*self.by_name.get(state)?)?;
         let clip = leading_clip(player, bound)?;
         Some((clip.source.as_str(), clip.clip.as_str(), clip.node))
     }
 
     /// The node a state plays, when the state compiled.
-    pub fn node(&self, state: &str) -> Option<AnimationNodeIndex> {
+    pub fn node(&self, state: &str) -> Option<BlendNodeIndex> {
         self.by_name
             .get(state)
             .map(|&index| self.states[index].node)
@@ -618,7 +618,7 @@ pub(crate) fn bind_animation_graphs(
     assets: Res<Assets<AnimationGraphAsset>>,
     gltfs: Res<Assets<Gltf>>,
     clips: Res<Assets<AnimationClip>>,
-    mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut graphs: ResMut<Assets<BlendGraph>>,
     unbound: Query<
         (
             Entity,
@@ -682,7 +682,7 @@ pub(crate) fn bind_animation_graphs(
             continue;
         };
 
-        let mut graph = AnimationGraph::new();
+        let mut graph = BlendGraph::new();
         let mut states = Vec::new();
         let mut by_name = HashMap::new();
         for state in &def.states {
@@ -725,7 +725,7 @@ pub(crate) fn bind_animation_graphs(
 
         commands
             .entity(root)
-            .insert((player, AnimationGraphHandle(graph.clone()), transitions));
+            .insert((player, BlendGraphHandle(graph.clone()), transitions));
 
         let mut params = params.cloned().unwrap_or_default();
         for parameter in &def.parameters {
@@ -796,7 +796,7 @@ pub(crate) fn rebind_edited_graphs(
 pub(crate) fn advance_animation_graphs(
     time: Res<Time>,
     assets: Res<Assets<AnimationGraphAsset>>,
-    mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut graphs: ResMut<Assets<BlendGraph>>,
     mut graphed: Query<(
         Entity,
         &AnimationGraphSource,
@@ -897,7 +897,7 @@ fn compile_state(
     state: &AnimationGraphState,
     files: &HashMap<&str, &Gltf>,
     clips: &Assets<AnimationClip>,
-    graph: &mut AnimationGraph,
+    graph: &mut BlendGraph,
 ) -> Option<BoundState> {
     match &state.motion {
         AnimationMotion::Clip(clip_ref) => {
@@ -1098,9 +1098,9 @@ fn write_weights(
     bound: &AnimationGraphBound,
     params: &AnimationParams,
     player: &mut AnimationPlayer,
-    graphs: &mut Assets<AnimationGraph>,
+    graphs: &mut Assets<BlendGraph>,
 ) {
-    let mut shares: Vec<(AnimationNodeIndex, f32)> = Vec::new();
+    let mut shares: Vec<(BlendNodeIndex, f32)> = Vec::new();
     for state in bound.states.iter().filter(|state| state.blend) {
         shares.push((
             state.node,

@@ -366,7 +366,7 @@ pub fn backfill_ui_root_size(world: &mut World) {
     // Once the root is the canvas's own height its default cross-axis
     // alignment would stretch every child down it. Only when the document
     // states nothing of its own.
-    if node.align_items == AlignItems::Default {
+    if node.align_items == AlignItems::Normal {
         node.align_items = sized.align_items;
     }
     if let Some(mut live) = world.get_mut::<Node>(root) {

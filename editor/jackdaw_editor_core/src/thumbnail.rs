@@ -1184,7 +1184,7 @@ fn apply_layer_recursive(commands: &mut Commands, entity: Entity, children: &Que
 }
 
 /// Native LOD parts and asynchronously spawned glTF descendants may arrive
-/// after the initial framing pass. RenderLayers are not inherited by Bevy.
+/// after the initial framing pass. `RenderLayers` are not inherited by Bevy.
 /// Run after native LOD placement, before per-camera visibility is checked.
 fn sync_thumbnail_layers(
     mut commands: Commands,

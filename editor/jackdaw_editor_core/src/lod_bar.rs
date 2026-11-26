@@ -8,7 +8,6 @@
 
 use bevy::picking::events::{PointerClick, PointerDrag, PointerDragEnd, PointerDragStart};
 use bevy::prelude::*;
-use bevy::ui::FocusPolicy;
 use jackdaw_api::prelude::*;
 use jackdaw_commands::CommandHistory;
 use jackdaw_feathers::button::{ButtonOperatorCall, ButtonProps, button};
@@ -214,7 +213,6 @@ pub fn spawn_bar(world: &mut World, parent: Entity, target: BarTarget) -> Option
                 linebreak: bevy::text::LineBreak::NoWrap,
                 ..default()
             },
-            FocusPolicy::Pass,
             Pickable::IGNORE,
             ChildOf(segment),
         ));
